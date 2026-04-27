@@ -39,6 +39,7 @@ env_logger = "0.11"
 cpal = "0.15"
 hound = "3.5"
 pdf-extract = "0.7"
+lopdf = "0.32"
 tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
 url = "2"
 base64 = "0.22"
