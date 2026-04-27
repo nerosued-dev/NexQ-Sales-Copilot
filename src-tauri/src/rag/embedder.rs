@@ -71,9 +71,9 @@ fn model_char_limit(model: &str) -> usize {
         // mxbai-embed-large: 512 subword tokens
         1_700
     } else if m.contains("nomic-embed-text") {
-        // nomic-embed-text base: 2048 subword tokens; v1.5: 8192.
-        // Use conservative 2048-token estimate (~4 bytes/token for Spanish) = 5000 chars
-        5_000
+        // nomic-embed-text base: 2048 subword tokens.
+        // Spanish text ~2 bytes/BPE token → safe limit ~2400 chars
+        2_400
     } else if m.contains("bge-large") || m.contains("bge-base") {
         // BGE models: 512 subword tokens
         1_700
