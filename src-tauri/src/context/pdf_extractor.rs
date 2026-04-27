@@ -13,15 +13,15 @@ pub fn extract_text_from_pdf(file_path: &str) -> Result<String, String> {
         Ok(text) => {
             let trimmed = text.trim().to_string();
             if trimmed.is_empty() {
-                log::warn!(
-                    "PDF extraction returned empty text for: {}",
-                    file_path
+                return Err(
+                    "PDF has no extractable text. It may be a scanned/image-based PDF \
+                     (no text layer) or use unsupported font encoding. \
+                     Try exporting as a text-based PDF or convert to .txt first."
+                        .to_string(),
                 );
             }
             Ok(trimmed)
         }
-        Err(e) => {
-            Err(format!("Failed to extract text from PDF: {}", e))
-        }
+        Err(e) => Err(format!("Failed to extract text from PDF: {}", e)),
     }
 }
