@@ -341,8 +341,8 @@ fn mac_roman_map() -> CharMap {
         (0xC5,'\u{2026}'),(0xC6,'\u{00A0}'),(0xC7,'À'),(0xC8,'Ã'),(0xC9,'Õ'),
         (0xCA,'Œ'),(0xCB,'œ'),(0xCC,'–'),(0xCD,'—'),(0xCE,'\u{201C}'),(0xCF,'\u{201D}'),
         (0xD0,'\u{2018}'),(0xD1,'\u{2019}'),(0xD2,'÷'),(0xD3,'\u{25CA}'),(0xD4,'ÿ'),
-        (0xD5,'Ÿ'),(0xD6,'\u{2044}'),(0xD7,'€'),(0xD8,'‹'),(0xD9,'›'),(0xDA,'fi'),
-        (0xDB,'fl'),(0xDC,'‡'),(0xDD,'·'),(0xDE,'‚'),(0xDF,'„'),(0xE0,'‰'),
+        (0xD5,'Ÿ'),(0xD6,'\u{2044}'),(0xD7,'€'),(0xD8,'‹'),(0xD9,'›'),(0xDA,'f'),
+        (0xDB,'f'),(0xDC,'‡'),(0xDD,'·'),(0xDE,'‚'),(0xDF,'„'),(0xE0,'‰'),
         (0xE1,'Â'),(0xE2,'Ê'),(0xE3,'Á'),(0xE4,'Ë'),(0xE5,'È'),(0xE6,'Í'),(0xE7,'Î'),
         (0xE8,'Ï'),(0xE9,'Ì'),(0xEA,'Ó'),(0xEB,'Ô'),(0xED,'Ò'),(0xEE,'Ú'),(0xEF,'Û'),
         (0xF0,'Ù'),(0xF1,'ı'),(0xF2,'ˆ'),(0xF3,'˜'),(0xF4,'¯'),(0xF5,'˘'),(0xF6,'˙'),
@@ -358,7 +358,7 @@ fn standard_map() -> CharMap {
     for b in 0x20u8..=0x7Eu8 { map.insert(b, b as char); }
     let ext: &[(u8, char)] = &[
         (0xA1,'Æ'),(0xA2,'æ'),(0xA3,'°'),(0xA4,'/'),(0xA5,'Ø'),(0xA6,'ø'),
-        (0xA8,'\u{201C}'),(0xA9,'\u{201D}'),(0xAA,'\u{2019}'),(0xAB,'fi'),(0xAC,'fl'),
+        (0xA8,'\u{201C}'),(0xA9,'\u{201D}'),(0xAA,'\u{2019}'),(0xAB,'f'),(0xAC,'f'),
         (0xAE,'\u{2013}'),(0xAF,'\u{2014}'),(0xB0,'\u{2018}'),(0xB1,'†'),
         (0xB4,'•'),(0xB6,'¶'),(0xB7,'§'),(0xBB,'–'),(0xBC,'\u{2022}'),
         (0xBF,'¿'),(0xC0,'`'),(0xC1,'´'),(0xC2,'^'),(0xC3,'~'),(0xC4,'¯'),
@@ -436,7 +436,7 @@ fn glyph_name_to_char(name: &str) -> Option<char> {
         "twosuperior"=>'²',"threesuperior"=>'³',"mu"=>'µ',"paragraph"=>'¶',
         "periodcentered"=>'·',"ordmasculine"=>'º',
         "onequarter"=>'¼',"onehalf"=>'½',"threequarters"=>'¾',
-        "fi"=>'fi',"fl"=>'fl',"ff"=>'f',"ffi"=>'f',"ffl"=>'f',
+        "fi"=>'f',"fl"=>'f',"ff"=>'f',"ffi"=>'f',"ffl"=>'f',
         "lslash"=>'ł',"Lslash"=>'Ł',"oe"=>'œ',"OE"=>'Œ',
         "scaron"=>'š',"Scaron"=>'Š',"zcaron"=>'ž',"Zcaron"=>'Ž',
         "trademark"=>'™',"Euro"=>'€',
