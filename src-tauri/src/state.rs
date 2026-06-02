@@ -8,6 +8,7 @@ use crate::tray::TrayManager;
 use crate::credentials::CredentialManager;
 use crate::db::DatabaseManager;
 use crate::intelligence::IntelligenceEngine;
+use crate::llm::gemini_cache::CachedContent;
 use crate::llm::openrouter_models::OpenRouterModelCache;
 use crate::llm::LLMRouter;
 use crate::rag::RagManager;
@@ -99,6 +100,9 @@ pub struct AppState {
     pub openrouter_cache: Arc<Mutex<Option<OpenRouterModelCache>>>,
     /// Tray icon manager — initialized after the tray handle is available.
     pub tray_manager: Arc<Mutex<Option<TrayManager>>>,
+    /// Active Gemini context cache for the current meeting session.
+    /// Set when the user creates a cache; cleared on delete or meeting end.
+    pub gemini_cache: Arc<Mutex<Option<CachedContent>>>,
 }
 
 impl AppState {
@@ -127,6 +131,7 @@ impl AppState {
             pending_recording: Arc::new(Mutex::new(None)),
             openrouter_cache: Arc::new(Mutex::new(None)),
             tray_manager: Arc::new(Mutex::new(None)),
+            gemini_cache: Arc::new(Mutex::new(None)),
         }
     }
 }

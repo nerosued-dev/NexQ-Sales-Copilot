@@ -1,6 +1,7 @@
 pub mod audio_commands;
 pub mod context_commands;
 pub mod credential_commands;
+pub mod gemini_cache_commands;
 pub mod intelligence_commands;
 pub mod llm_commands;
 pub mod meeting_commands;

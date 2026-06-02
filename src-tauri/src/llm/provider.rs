@@ -7,6 +7,10 @@ use thiserror::Error;
 pub struct GenerationParams {
     pub temperature: Option<f64>,
     pub max_tokens: Option<u64>,
+    /// Gemini context cache name (e.g. "cachedContents/abc123").
+    /// When set, GeminiClient uses the cached content instead of re-sending documents.
+    /// Ignored by all other providers.
+    pub cache_name: Option<String>,
 }
 
 impl Default for GenerationParams {
@@ -14,6 +18,7 @@ impl Default for GenerationParams {
         Self {
             temperature: None,
             max_tokens: None,
+            cache_name: None,
         }
     }
 }

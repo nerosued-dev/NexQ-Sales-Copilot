@@ -175,16 +175,26 @@ impl LLMProvider for GeminiClient {
             gen_config["temperature"] = json!(temp);
         }
 
-        let mut body = json!({
-            "contents": contents,
-            "generationConfig": gen_config
-        });
-
-        if let Some(system) = system_instruction {
-            body["systemInstruction"] = json!({
-                "parts": [{"text": system}]
+        let body = if let Some(cache_name) = &params.cache_name {
+            // Cache active: reference cached content, skip systemInstruction (it's in the cache).
+            // Only dynamic contents (transcript + question) are sent fresh.
+            json!({
+                "cachedContent": cache_name,
+                "contents": contents,
+                "generationConfig": gen_config
+            })
+        } else {
+            let mut b = json!({
+                "contents": contents,
+                "generationConfig": gen_config
             });
-        }
+            if let Some(system) = system_instruction {
+                b["systemInstruction"] = json!({
+                    "parts": [{"text": system}]
+                });
+            }
+            b
+        };
 
         // NOTE: llm_stream_start is emitted by IntelligenceEngine::generate_assist()
         // with the correct mode. Do NOT emit it here — it would overwrite the mode.

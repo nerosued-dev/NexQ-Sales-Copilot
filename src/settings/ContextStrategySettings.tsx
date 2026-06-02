@@ -4,6 +4,13 @@ import { useRagStore } from "../stores/ragStore";
 import { useRagEvents } from "../hooks/useRagEvents";
 import type { ContextStrategy, RagConfig } from "../lib/types";
 import {
+  createGeminiContextCache,
+  deleteGeminiContextCache,
+  getGeminiCacheStatus,
+  type GeminiCacheInfo,
+} from "../lib/ipc";
+import { showToast } from "../stores/toastStore";
+import {
   Database,
   Cloud,
   Wifi,
@@ -22,6 +29,7 @@ import {
   Zap,
   Target,
   Gauge,
+  FlameKindling,
 } from "lucide-react";
 
 // ─── Preset Definitions ───────────────────────────────────────────────────────
@@ -517,20 +525,22 @@ export function ContextStrategySettings() {
           </p>
         </button>
 
-        <div className="relative flex flex-col items-start rounded-xl border border-border/30 bg-accent/10 p-4 text-left opacity-60 cursor-not-allowed">
-          <div className="absolute -top-1.5 right-2">
-            <span className="rounded-full bg-muted px-2 py-0.5 text-meta font-medium text-muted-foreground">
-              Coming Soon
-            </span>
-          </div>
+        <button
+          onClick={() => handleStrategyChange("gemini_cache")}
+          className={`relative flex flex-col items-start rounded-xl border p-4 text-left transition-all duration-150 ${
+            contextStrategy === "gemini_cache"
+              ? "border-orange-400/60 bg-orange-400/5 ring-1 ring-orange-400/20"
+              : "border-border/50 hover:border-border hover:bg-accent/50"
+          }`}
+        >
           <div className="flex items-center gap-2">
-            <Cloud className="h-4 w-4 text-muted-foreground" />
-            <span className="text-sm font-medium text-muted-foreground">Gemini Context Cache</span>
+            <Cloud className="h-4 w-4 text-orange-400" />
+            <span className="text-sm font-medium text-foreground">Gemini Context Cache</span>
           </div>
-          <p className="mt-1.5 text-xs text-muted-foreground/70 leading-relaxed">
-            Cache documents in Gemini for fast repeated queries
+          <p className="mt-1.5 text-xs text-muted-foreground leading-relaxed">
+            Cache docs in Gemini once — skip local embedding entirely
           </p>
-        </div>
+        </button>
       </div>
 
       {contextStrategy === "local_rag" && (
@@ -999,6 +1009,129 @@ export function ContextStrategySettings() {
             </p>
           </div>
         </>
+      )}
+
+      <GeminiCachePanel />
+    </div>
+  );
+}
+
+// ─── Gemini Context Cache Panel ───────────────────────────────────────────────
+function GeminiCachePanel() {
+  const contextStrategy = useConfigStore((s) => s.contextStrategy);
+  const [cache, setCache] = useState<GeminiCacheInfo | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [model, setModel] = useState("gemini-2.0-flash-001");
+  const [ttl, setTtl] = useState(3600);
+
+  useEffect(() => {
+    if (contextStrategy !== "gemini_cache") return;
+    getGeminiCacheStatus().then(setCache).catch(() => {});
+  }, [contextStrategy]);
+
+  if (contextStrategy !== "gemini_cache") return null;
+
+  async function handleCreate() {
+    setLoading(true);
+    try {
+      const info = await createGeminiContextCache(model, ttl);
+      setCache(info);
+      showToast(`Cache created — ${info.total_token_count.toLocaleString()} tokens cached`, "success");
+    } catch (e: any) {
+      showToast(String(e), "error");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function handleDelete() {
+    setLoading(true);
+    try {
+      await deleteGeminiContextCache();
+      setCache(null);
+      showToast("Gemini cache cleared", "success");
+    } catch (e: any) {
+      showToast(String(e), "error");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  const expireLabel = cache
+    ? new Date(cache.expire_time).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+    : null;
+
+  return (
+    <div className="rounded-xl border border-border/30 bg-card/50 p-5 space-y-4">
+      <div className="flex items-center gap-2">
+        <FlameKindling className="h-4 w-4 text-orange-400" />
+        <h3 className="text-sm font-semibold text-foreground">Gemini Context Cache</h3>
+        {cache && (
+          <span className="ml-auto flex items-center gap-1 rounded-full bg-green-500/15 px-2 py-0.5 text-xs font-medium text-green-400">
+            <CheckCircle2 className="h-3 w-3" /> Active · expires {expireLabel}
+          </span>
+        )}
+      </div>
+
+      <p className="text-xs text-muted-foreground leading-relaxed">
+        Upload your context documents to Gemini's servers once. Each query skips local
+        embedding entirely — <span className="text-foreground/80 font-medium">~3-5s faster per response</span> on
+        CPU-only machines.
+      </p>
+
+      {!cache ? (
+        <div className="flex flex-col gap-3">
+          <div className="flex gap-2">
+            <div className="flex-1">
+              <label className="mb-1 block text-xs text-muted-foreground">Model</label>
+              <select
+                value={model}
+                onChange={(e) => setModel(e.target.value)}
+                className="w-full rounded-lg border border-border/50 bg-background px-3 py-2 text-sm text-foreground focus:border-primary focus:outline-none"
+              >
+                <option value="gemini-2.0-flash-001">gemini-2.0-flash-001</option>
+                <option value="gemini-1.5-flash-001">gemini-1.5-flash-001</option>
+                <option value="gemini-1.5-pro-001">gemini-1.5-pro-001</option>
+              </select>
+            </div>
+            <div className="w-28">
+              <label className="mb-1 block text-xs text-muted-foreground">TTL</label>
+              <select
+                value={ttl}
+                onChange={(e) => setTtl(Number(e.target.value))}
+                className="w-full rounded-lg border border-border/50 bg-background px-3 py-2 text-sm text-foreground focus:border-primary focus:outline-none"
+              >
+                <option value={1800}>30 min</option>
+                <option value={3600}>1 hour</option>
+                <option value={7200}>2 hours</option>
+                <option value={86400}>24 hours</option>
+              </select>
+            </div>
+          </div>
+          <button
+            onClick={handleCreate}
+            disabled={loading}
+            className="inline-flex items-center gap-2 rounded-lg bg-primary px-4 py-2 text-sm font-medium text-primary-foreground transition-colors hover:bg-primary/90 disabled:opacity-50"
+          >
+            {loading ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Cloud className="h-3.5 w-3.5" />}
+            Create Cache from Context Docs
+          </button>
+        </div>
+      ) : (
+        <div className="flex items-center justify-between rounded-lg border border-border/30 bg-background/50 px-4 py-3">
+          <div className="text-xs text-muted-foreground space-y-0.5">
+            <p><span className="text-foreground/70 font-medium">Model:</span> {cache.model.replace("models/", "")}</p>
+            <p><span className="text-foreground/70 font-medium">Tokens cached:</span> {cache.total_token_count.toLocaleString()}</p>
+          </div>
+          <button
+            onClick={handleDelete}
+            disabled={loading}
+            className="inline-flex items-center gap-1.5 rounded-lg border border-border/50 px-3 py-1.5 text-xs text-muted-foreground transition-colors hover:border-red-500/50 hover:text-red-400 disabled:opacity-50"
+          >
+            {loading ? <Loader2 className="h-3 w-3 animate-spin" /> : <Trash2 className="h-3 w-3" />}
+            Clear
+          </button>
+        </div>
       )}
     </div>
   );

@@ -38,6 +38,8 @@ use commands::settings_commands;
 use commands::model_commands;
 // == MODULE COMMANDS: stealth ==
 use commands::stealth_commands;
+// == MODULE COMMANDS: gemini cache ==
+use commands::gemini_cache_commands;
 // == MODULE COMMANDS: rag ==
 use commands::rag_commands;
 // == MODULE COMMANDS: recording ==
@@ -65,6 +67,9 @@ fn show_launcher(app: &tauri::AppHandle) {
 /// Show the overlay window and hide the launcher window.
 fn show_overlay(app: &tauri::AppHandle) {
     if let Some(overlay) = app.get_webview_window("overlay") {
+        // Apply OS-level blur (DwmEnableBlurBehindWindow) so other OS windows show through
+        #[cfg(target_os = "windows")]
+        { use window_vibrancy::apply_blur; let _ = apply_blur(&overlay, Some((0, 0, 0, 0))); }
         let _ = overlay.show();
         let _ = overlay.set_focus();
     }
@@ -514,6 +519,10 @@ pub fn run() {
             tray_commands::set_tray_tooltip,
             tray_commands::set_meeting_start_time,
             tray_commands::rebuild_tray_menu,
+            // == COMMANDS: gemini cache ==
+            gemini_cache_commands::create_gemini_context_cache,
+            gemini_cache_commands::delete_gemini_context_cache,
+            gemini_cache_commands::get_gemini_cache_status,
             // == COMMANDS: rag ==
             rag_commands::rebuild_rag_index,
             rag_commands::rebuild_file_index,

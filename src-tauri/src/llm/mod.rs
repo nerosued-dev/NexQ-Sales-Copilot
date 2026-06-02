@@ -1,6 +1,7 @@
 pub mod anthropic;
 pub mod custom;
 pub mod gemini;
+pub mod gemini_cache;
 pub mod ollama;
 pub mod openai_compat;
 pub mod openrouter_models;
