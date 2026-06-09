@@ -340,6 +340,13 @@ impl DeepgramSTT {
 
         let final_speaker = diarized_speaker.unwrap_or_else(|| speaker.to_string());
 
+        if is_final {
+            log::debug!(
+                "DeepgramSTT: party={} final_speaker={} text={:?}",
+                speaker, final_speaker, &text[..text.len().min(40)]
+            );
+        }
+
         // Convert Deepgram's stream-relative offset to epoch timestamp.
         // The frontend expects epoch timestamps (consistent with Web Speech's Date.now()).
         let stream_offset_ms = response
@@ -606,7 +613,7 @@ impl STTProvider for DeepgramSTT {
         Self::spawn_reader_task(
             read_half,
             result_tx,
-            "User".to_string(),
+            self.party.clone(),
             Arc::clone(&self.stop_flag),
             start_time,
             Arc::clone(&self.connection_state),

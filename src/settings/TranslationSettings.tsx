@@ -218,6 +218,12 @@ export function TranslationSettings() {
   const [testedProviders, setTestedProviders] = useState<Set<string>>(new Set());
   const [opusMtModels, setOpusMtModels] = useState<OpusMtModelStatus[]>([]);
 
+  // Sync selectedProvider grid when the active provider loads from storage
+  // (loadConfig runs async after mount, so useState initial value may be stale)
+  useEffect(() => {
+    setSelectedProvider(provider);
+  }, [provider]);
+
   const currentProviderOption = ALL_PROVIDERS.find((p) => p.value === selectedProvider);
 
   // ── Load OPUS-MT model status for badge display + language filtering ──
@@ -411,11 +417,11 @@ export function TranslationSettings() {
   }, [apiKey, azureRegion, selectedProvider, currentProviderOption, setStoreProvider]);
 
   const handleTestLocal = useCallback(async () => {
-
     setConnectionStatus("testing");
     setStatusMessage("Testing...");
     setResponseMs(null);
 
+    const previousProvider = provider;
     try {
       await setTranslationProvider(selectedProvider);
       const result = await testTranslationConnection(selectedProvider);
@@ -429,14 +435,22 @@ export function TranslationSettings() {
         setTestedProviders((prev) => new Set(prev).add(selectedProvider));
         setStoreProvider(selectedProvider);
       } else {
+        // Restore previous provider on test failure
+        if (previousProvider && previousProvider !== selectedProvider) {
+          await setTranslationProvider(previousProvider).catch(() => {});
+        }
         setConnectionStatus("error");
         setStatusMessage(result.error || "Connection failed");
       }
     } catch (e) {
+      // Restore previous provider on exception
+      if (previousProvider && previousProvider !== selectedProvider) {
+        await setTranslationProvider(previousProvider).catch(() => {});
+      }
       setConnectionStatus("error");
       setStatusMessage(e instanceof Error ? e.message : "Test failed");
     }
-  }, [selectedProvider, setStoreProvider]);
+  }, [selectedProvider, provider, setStoreProvider]);
 
   const handleMakeActive = useCallback(async () => {
     try {
@@ -483,11 +497,11 @@ export function TranslationSettings() {
   const isLlm = selectedProvider === "llm";
 
   // ── "Make Active" gating logic ──
-  // Cloud: ONLY after successful test in this session. OPUS-MT: when model is active. LLM: always.
+  // Cloud: tested this session OR has a stored key (and key not dirty). OPUS-MT: when model is active. LLM: always.
   const canMakeActive = (() => {
     if (selectedProvider === provider) return false; // already active
     if (isOpusMt) return opusMtHasActive;
-    if (isCloud) return testedProviders.has(selectedProvider) && !keyDirty;
+    if (isCloud) return (testedProviders.has(selectedProvider) || hasStoredKey) && !keyDirty;
     if (isLlm) return true;
     return false;
   })();

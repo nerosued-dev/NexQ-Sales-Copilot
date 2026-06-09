@@ -13,6 +13,13 @@ import type { TranscriptSegment, TranscriptUpdateEvent } from "../lib/types";
 // Cache reference to avoid repeated imports
 let _meetingStoreRef: typeof import("../stores/meetingStore") | null = null;
 
+// Dev log helper — imported lazily to avoid circular deps
+function devLog(msg: string) {
+  import("../stores/devLogStore").then(({ useDevLogStore }) => {
+    useDevLogStore.getState().addEntry("info", "speaker", msg);
+  }).catch(() => {});
+}
+
 /**
  * Process a transcript segment through the speaker store:
  * - Resolve speaker_id from segment metadata (mode-aware)
@@ -55,6 +62,13 @@ function processSpeaker(segment: TranscriptSegment): TranscriptSegment | null {
     }
   } else {
     speakerId = segment.speaker === "User" ? "you" : "them";
+  }
+
+  // Debug: log speaker assignment for final segments
+  if (segment.is_final) {
+    devLog(
+      `[speaker] "${segment.text.slice(0, 40)}" | raw_speaker=${segment.speaker ?? "?"} raw_speaker_id=${segment.speaker_id ?? "none"} mode=${isInPerson ? "in_person" : "online"} → speakerId=${speakerId}`
+    );
   }
 
   // Skip registration and stats for pending segments
