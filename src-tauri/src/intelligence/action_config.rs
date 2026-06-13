@@ -18,6 +18,10 @@ pub struct ActionConfig {
     pub include_custom_instructions: bool,
     pub include_detected_question: bool,
 
+    /// Enable provider-native web search/grounding for this action (Gemini google_search, OpenRouter :online).
+    #[serde(default)]
+    pub web_search: bool,
+
     pub transcript_window_seconds: Option<u64>,
     pub rag_top_k: Option<usize>,
     pub temperature: Option<f64>,
@@ -48,10 +52,12 @@ impl Default for GlobalDefaults {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[serde(default)]
 pub struct InstructionPresets {
     pub tone: Option<String>,
     pub format: Option<String>,
     pub length: Option<String>,
+    pub opinion: Option<String>,
 }
 
 impl Default for InstructionPresets {
@@ -60,6 +66,7 @@ impl Default for InstructionPresets {
             tone: None,
             format: None,
             length: None,
+            opinion: None,
         }
     }
 }
@@ -91,6 +98,7 @@ impl Default for AllActionConfigs {
                 include_rag_chunks: true,
                 include_custom_instructions: true,
                 include_detected_question: true,
+                web_search: false,
                 transcript_window_seconds: None,
                 rag_top_k: None,
                 temperature: None,
@@ -112,6 +120,7 @@ impl Default for AllActionConfigs {
                 include_rag_chunks: false,
                 include_custom_instructions: true,
                 include_detected_question: true,
+                web_search: false,
                 transcript_window_seconds: Some(60),
                 rag_top_k: None,
                 temperature: None,
@@ -133,6 +142,7 @@ impl Default for AllActionConfigs {
                 include_rag_chunks: false,
                 include_custom_instructions: true,
                 include_detected_question: true,
+                web_search: false,
                 transcript_window_seconds: Some(30),
                 rag_top_k: None,
                 temperature: None,
@@ -154,6 +164,7 @@ impl Default for AllActionConfigs {
                 include_rag_chunks: false,
                 include_custom_instructions: true,
                 include_detected_question: false,
+                web_search: false,
                 transcript_window_seconds: None,
                 rag_top_k: None,
                 temperature: None,
@@ -175,6 +186,7 @@ impl Default for AllActionConfigs {
                 include_rag_chunks: false,
                 include_custom_instructions: false,
                 include_detected_question: false,
+                web_search: false,
                 transcript_window_seconds: Some(0), // 0 = all transcript
                 rag_top_k: None,
                 temperature: None,
@@ -196,6 +208,7 @@ impl Default for AllActionConfigs {
                 include_rag_chunks: true,
                 include_custom_instructions: true,
                 include_detected_question: false,
+                web_search: true,
                 transcript_window_seconds: None,
                 rag_top_k: None,
                 temperature: None,
@@ -217,6 +230,7 @@ impl Default for AllActionConfigs {
                 include_rag_chunks: false,
                 include_custom_instructions: false,
                 include_detected_question: false,
+                web_search: false,
                 transcript_window_seconds: Some(0), // 0 = all transcript (need full meeting)
                 rag_top_k: None,
                 temperature: Some(0.1), // Low temperature for structured JSON output
@@ -237,6 +251,7 @@ impl Default for AllActionConfigs {
                 include_rag_chunks: false,
                 include_custom_instructions: false,
                 include_detected_question: false,
+                web_search: false,
                 transcript_window_seconds: Some(0), // 0 = all transcript (need full meeting)
                 rag_top_k: None,
                 temperature: Some(0.1), // Low temperature for structured JSON output

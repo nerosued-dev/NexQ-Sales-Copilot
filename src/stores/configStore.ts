@@ -153,6 +153,9 @@ interface ConfigState {
   aiResponseHPad: number;
   aiResponseAlign: "left" | "center" | "right";
 
+  // Overlay appearance
+  overlayOpacity: number;
+
   // STT language (BCP-47, e.g. "en-US", "es-ES")
   sttLanguage: string;
 
@@ -221,6 +224,7 @@ interface ConfigState {
   setAiResponseLineHeight: (v: number) => void;
   setAiResponseHPad: (v: number) => void;
   setAiResponseAlign: (align: "left" | "center" | "right") => void;
+  setOverlayOpacity: (opacity: number) => void;
   setSttLanguage: (language: string) => void;
   setShowPostMeetingTranslation: (enabled: boolean) => void;
   toggleOpenRouterFavorite: (id: string) => void;
@@ -275,6 +279,7 @@ export const useConfigStore = create<ConfigState>((set) => ({
   aiResponseLineHeight: 1.6,
   aiResponseHPad: 0,
   aiResponseAlign: "left" as const,
+  overlayOpacity: 0.65,
   sttLanguage: "en-US",
   showPostMeetingTranslation: true,
   openrouterFavorites: [],
@@ -562,6 +567,10 @@ export const useConfigStore = create<ConfigState>((set) => ({
     set({ aiResponseAlign: align });
     persistValue("aiResponseAlign", align);
   },
+  setOverlayOpacity: (opacity) => {
+    set({ overlayOpacity: opacity });
+    persistValue("overlayOpacity", opacity);
+  },
   setSttLanguage: (language) => {
     set({ sttLanguage: language });
     persistValue("sttLanguage", language);
@@ -675,6 +684,7 @@ export const useConfigStore = create<ConfigState>((set) => ({
       const aiResponseLineHeight = await store.get<number>("aiResponseLineHeight");
       const aiResponseHPad = await store.get<number>("aiResponseHPad");
       const aiResponseAlign = await store.get<string>("aiResponseAlign");
+      const overlayOpacity = await store.get<number>("overlayOpacity");
       const sttLanguage = await store.get<string>("sttLanguage");
       const showPostMeetingTranslation = await store.get<boolean>("showPostMeetingTranslation");
       const trayNotifications = await store.get<boolean>("trayNotifications");
@@ -823,6 +833,7 @@ export const useConfigStore = create<ConfigState>((set) => ({
         aiResponseLineHeight: aiResponseLineHeight ?? 1.6,
         aiResponseHPad: aiResponseHPad ?? 0,
         aiResponseAlign: (aiResponseAlign as "left" | "center" | "right") ?? "left",
+        overlayOpacity: overlayOpacity ?? 0.65,
         sttLanguage: sttLanguage ?? "en-US",
         showPostMeetingTranslation: showPostMeetingTranslation ?? true,
         ...(trayNotifications != null && { trayNotifications }),
@@ -881,6 +892,9 @@ export const useConfigStore = create<ConfigState>((set) => ({
       });
       store.onKeyChange<WhisperDualPassConfig>("whisperDualPass", (val) => {
         if (val != null) set({ whisperDualPass: val });
+      });
+      store.onKeyChange<number>("overlayOpacity", (val) => {
+        if (val != null) set({ overlayOpacity: val });
       });
 
       // Sync persisted dual-pass config to Rust backend on startup.

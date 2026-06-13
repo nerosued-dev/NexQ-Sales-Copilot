@@ -146,8 +146,15 @@ impl LLMProvider for OpenAICompatClient {
             })
             .collect();
 
+        // OpenRouter: ":online" suffix enables web search grounding (via Exa) for any model.
+        let model_id = if params.enable_web_search && self.config.provider_name == "openrouter" {
+            format!("{}:online", model)
+        } else {
+            model.to_string()
+        };
+
         let mut body = json!({
-            "model": model,
+            "model": model_id,
             "messages": msgs,
             "stream": true
         });

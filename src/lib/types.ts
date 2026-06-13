@@ -194,6 +194,11 @@ export type IntelligenceMode =
   | "ActionItemsExtraction"
   | "BookmarkSuggestions";
 
+export interface StreamSource {
+  title: string;
+  url: string;
+}
+
 export interface AIResponse {
   id: string;
   content: string;
@@ -203,6 +208,7 @@ export interface AIResponse {
   model: string;
   provider: string;
   latency_ms: number;
+  sources?: StreamSource[];
 }
 
 export interface ModelInfo {
@@ -515,6 +521,10 @@ export interface StreamEndEvent {
   latency_ms: number;
 }
 
+export interface StreamSourcesEvent {
+  sources: StreamSource[];
+}
+
 export type QuestionDetectedEvent = DetectedQuestion;
 
 export interface AudioLevelEvent {
@@ -661,6 +671,7 @@ export interface ActionConfig {
   includeRagChunks: boolean;
   includeCustomInstructions: boolean;
   includeDetectedQuestion: boolean;
+  webSearch: boolean;
 
   transcriptWindowSeconds: number | null; // null = use global default
   ragTopK: number | null;
@@ -679,6 +690,7 @@ export interface InstructionPresets {
   tone: string | null;
   format: string | null;
   length: string | null;
+  opinion: string | null;
 }
 
 export interface AllActionConfigs {

@@ -36,6 +36,7 @@
         "alwaysOnTop": true,
         "visible": false,
         "transparent": true,
+        "shadow": false,
         "x": 50,
         "y": 50
       }

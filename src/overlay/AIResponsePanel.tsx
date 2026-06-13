@@ -7,11 +7,12 @@ import {
   PinOff,
   Copy,
   Check,
+  Globe,
 } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { getModeLabel } from "../lib/utils";
-import type { AIResponse } from "../lib/types";
+import type { AIResponse, StreamSource } from "../lib/types";
 import { useConfigStore } from "../stores/configStore";
 import { ColorPickerButton } from "../components/ColorPickerButton";
 
@@ -23,6 +24,7 @@ export function AIResponsePanel() {
   const currentContent = useStreamStore((s) => s.currentContent);
   const currentMode = useStreamStore((s) => s.currentMode);
   const error = useStreamStore((s) => s.error);
+  const currentSources = useStreamStore((s) => s.currentSources);
   const responseHistory = useStreamStore((s) => s.responseHistory);
   const pinnedResponses = useStreamStore((s) => s.pinnedResponses);
   const pinResponse = useStreamStore((s) => s.pinResponse);
@@ -215,6 +217,7 @@ export function AIResponsePanel() {
                 {currentContent}
               </ReactMarkdown>
             </div>
+            <SourcesList sources={currentSources} />
           </div>
         )}
 
@@ -254,6 +257,7 @@ export function AIResponsePanel() {
                 {displayContent}
               </ReactMarkdown>
             </div>
+            <SourcesList sources={displayResponse.sources} />
           </div>
         )}
 
@@ -317,6 +321,27 @@ export function AIResponsePanel() {
 }
 
 // --- Sub-components ---
+
+function SourcesList({ sources }: { sources?: StreamSource[] }) {
+  if (!sources || sources.length === 0) return null;
+  return (
+    <div className="flex flex-wrap items-center gap-1.5 border-t border-border/10 pt-2">
+      <Globe className="h-3 w-3 shrink-0 text-muted-foreground/40" aria-hidden="true" />
+      {sources.map((source, idx) => (
+        <a
+          key={`${source.url}-${idx}`}
+          href={source.url}
+          target="_blank"
+          rel="noopener noreferrer"
+          title={source.url}
+          className="max-w-[14rem] truncate rounded-full bg-accent/30 px-2 py-0.5 text-meta text-muted-foreground/70 hover:bg-accent/50 hover:text-foreground/80 transition-colors"
+        >
+          {source.title}
+        </a>
+      ))}
+    </div>
+  );
+}
 
 function TabButton({
   label,

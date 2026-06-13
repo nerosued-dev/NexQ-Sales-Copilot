@@ -53,6 +53,72 @@ use commands::tray_commands;
 // == MODULE COMMANDS: updater ==
 use commands::updater_commands;
 
+/// Enable live blur-behind on a window via the undocumented `SetWindowCompositionAttribute`
+/// (user32). `DwmEnableBlurBehindWindow` (used automatically by tao for `transparent: true`)
+/// is a no-op on Windows 10/11 — this is the API that still works, and (unlike the old
+/// Aero blur) composites the live desktop/other windows behind, not just the wallpaper.
+/// Gradient color alpha is 0, so it adds no tint of its own; the overlay's own CSS
+/// (`.overlay-bg`) provides the adjustable dark tint on top.
+#[cfg(target_os = "windows")]
+fn enable_live_blur_behind(hwnd_raw: *mut std::ffi::c_void) {
+    use std::ffi::c_void;
+    use windows::core::PCSTR;
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
+
+    #[repr(C)]
+    struct AccentPolicy {
+        accent_state: u32,
+        accent_flags: u32,
+        gradient_color: u32,
+        animation_id: u32,
+    }
+
+    #[repr(C)]
+    struct WindowCompositionAttribData {
+        attrib: u32,
+        pv_data: *mut c_void,
+        cb_data: usize,
+    }
+
+    const WCA_ACCENT_POLICY: u32 = 19;
+    const ACCENT_ENABLE_BLURBEHIND: u32 = 3;
+
+    // Undocumented API: not present in user32.lib's import table, so it must be
+    // resolved at runtime via GetProcAddress instead of statically linked.
+    type SetWindowCompositionAttributeFn =
+        unsafe extern "system" fn(HWND, *mut WindowCompositionAttribData) -> i32;
+
+    unsafe {
+        let Ok(module) = GetModuleHandleA(PCSTR(b"user32.dll\0".as_ptr())) else {
+            return;
+        };
+        let Some(proc) = GetProcAddress(module, PCSTR(b"SetWindowCompositionAttribute\0".as_ptr()))
+        else {
+            return;
+        };
+        let set_window_composition_attribute: SetWindowCompositionAttributeFn =
+            std::mem::transmute(proc);
+
+        let mut policy = AccentPolicy {
+            accent_state: ACCENT_ENABLE_BLURBEHIND,
+            accent_flags: 0,
+            // ABGR. Alpha must be non-zero or DWM treats blur-behind as disabled
+            // and the window falls back to opaque. Alpha=1 is visually negligible.
+            gradient_color: 0x01000000,
+            animation_id: 0,
+        };
+
+        let mut data = WindowCompositionAttribData {
+            attrib: WCA_ACCENT_POLICY,
+            pv_data: &mut policy as *mut _ as *mut c_void,
+            cb_data: std::mem::size_of::<AccentPolicy>(),
+        };
+
+        set_window_composition_attribute(HWND(hwnd_raw), &mut data);
+    }
+}
+
 /// Show the launcher window and hide the overlay window.
 fn show_launcher(app: &tauri::AppHandle) {
     if let Some(launcher) = app.get_webview_window("launcher") {
@@ -67,9 +133,6 @@ fn show_launcher(app: &tauri::AppHandle) {
 /// Show the overlay window and hide the launcher window.
 fn show_overlay(app: &tauri::AppHandle) {
     if let Some(overlay) = app.get_webview_window("overlay") {
-        // Apply OS-level blur (DwmEnableBlurBehindWindow) so other OS windows show through
-        #[cfg(target_os = "windows")]
-        { use window_vibrancy::apply_blur; let _ = apply_blur(&overlay, Some((0, 0, 0, 0))); }
         let _ = overlay.show();
         let _ = overlay.set_focus();
     }
@@ -419,6 +482,14 @@ pub fn run() {
                         hide_all(&close_app);
                     }
                 });
+            }
+
+            // -- Enable live blur-behind on the overlay window for real desktop passthrough --
+            #[cfg(target_os = "windows")]
+            if let Some(overlay) = app.get_webview_window("overlay") {
+                if let Ok(hwnd) = overlay.hwnd() {
+                    enable_live_blur_behind(hwnd.0);
+                }
             }
 
             log::info!("NexQ initialized successfully");

@@ -144,7 +144,6 @@ impl OllamaEmbedder {
         // Handles models whose real BPE token count per char is higher than estimated
         // (common with Spanish/accented text on smaller context models).
         let mut char_limit = base_limit;
-        let mut last_err = String::new();
 
         loop {
             let safe_texts: Vec<String> = texts
@@ -169,9 +168,8 @@ impl OllamaEmbedder {
             if response.status().as_u16() == 400 {
                 let body = response.text().await.unwrap_or_default();
                 if body.contains("input length") || body.contains("context length") {
-                    last_err = format!("Ollama embed returned status 400 Bad Request: {}", body);
                     if char_limit <= 64 {
-                        break; // can't go smaller — give up
+                        return Err(format!("Ollama embed returned status 400 Bad Request: {}", body));
                     }
                     char_limit /= 2;
                     log::warn!(
@@ -196,8 +194,6 @@ impl OllamaEmbedder {
 
             return Ok(embed_response.embeddings);
         }
-
-        Err(last_err)
     }
 
     /// Embed a single query text with the "search_query: " prefix.

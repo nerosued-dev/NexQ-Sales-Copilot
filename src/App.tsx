@@ -21,7 +21,7 @@ import { SelectionToolbar } from "./components/SelectionToolbar";
 import { ActiveMeetingProvider } from "./components/ActiveMeetingProvider";
 import { listen } from "@tauri-apps/api/event";
 import { NEXQ_VERSION } from "./lib/version";
-import type { AppView } from "./lib/types";
+import type { AppView, Meeting, AudioMode, AIScenario } from "./lib/types";
 import { useDemoShortcut } from "./demo/useDemoShortcut";
 import { DemoPicker } from "./demo/DemoPicker";
 import { DemoBadge } from "./demo/DemoBadge";
@@ -105,6 +105,90 @@ function App() {
   useEffect(() => {
     loadRecentMeetings();
   }, [loadRecentMeetings]);
+
+  // Detect which Tauri window we're in ("launcher" or "overlay")
+  const [windowLabel, setWindowLabel] = useState<string>("");
+  useEffect(() => {
+    import("@tauri-apps/api/webviewWindow").then(({ getCurrentWebviewWindow }) => {
+      const label = getCurrentWebviewWindow().label;
+      setWindowLabel(label);
+      // Overlay window: transparent CSS + transparent WebView2 background for real passthrough
+      if (label === "overlay") {
+        document.body.style.background = "transparent";
+        document.documentElement.style.background = "transparent";
+        const win = getCurrentWebviewWindow();
+        win.setBackgroundColor([0, 0, 0, 0]).catch(() => {});
+      }
+    });
+  }, []);
+
+  // LAUNCHER window: when meeting starts, show overlay Tauri window and hide self
+  useEffect(() => {
+    if (windowLabel !== "launcher") return;
+    import("@tauri-apps/api/webviewWindow").then(async ({ WebviewWindow, getCurrentWebviewWindow }) => {
+      if (currentView === "overlay") {
+        const overlayWin = await WebviewWindow.getByLabel("overlay");
+        if (overlayWin) await overlayWin.show().catch(() => {});
+        await getCurrentWebviewWindow().hide().catch(() => {});
+      }
+    });
+  }, [currentView, windowLabel]);
+
+  // LAUNCHER window: listen for nexq:meeting_ended from overlay, show self + reset state
+  useEffect(() => {
+    if (windowLabel !== "launcher") return;
+    let unlisten: (() => void) | undefined;
+    listen("nexq:meeting_ended", () => {
+      useMeetingStore.setState({
+        currentView: "launcher",
+        activeMeeting: null,
+        isRecording: false,
+        meetingStartTime: null,
+        elapsedMs: 0,
+      });
+      useMeetingStore.getState().loadRecentMeetings().catch(() => {});
+      import("@tauri-apps/api/webviewWindow").then(({ getCurrentWebviewWindow }) => {
+        getCurrentWebviewWindow().show().catch(() => {});
+      });
+    }).then((fn) => { unlisten = fn; });
+    return () => { unlisten?.(); };
+  }, [windowLabel]);
+
+  // OVERLAY window: listen for nexq:meeting_started, initialize local state
+  useEffect(() => {
+    if (windowLabel !== "overlay") return;
+    let unlisten: (() => void) | undefined;
+    listen<{ meeting: Meeting; audioMode: AudioMode; aiScenario: AIScenario }>(
+      "nexq:meeting_started",
+      (e) => {
+        const { meeting, audioMode, aiScenario } = e.payload;
+        useMeetingStore.setState({
+          activeMeeting: meeting,
+          currentView: "overlay",
+          audioMode,
+          aiScenario,
+          isRecording: true,
+          meetingStartTime: Date.now(),
+          elapsedMs: 0,
+          lastPersistedIndex: 0,
+        });
+        useMeetingStore.getState().startTimer();
+      }
+    ).then((fn) => { unlisten = fn; });
+    return () => { unlisten?.(); };
+  }, [windowLabel]);
+
+  // OVERLAY window: when currentView→"launcher" (endMeetingFlow ran here), hide self + show launcher
+  useEffect(() => {
+    if (windowLabel !== "overlay") return;
+    if (currentView === "launcher") {
+      import("@tauri-apps/api/webviewWindow").then(async ({ WebviewWindow, getCurrentWebviewWindow }) => {
+        const launcherWin = await WebviewWindow.getByLabel("launcher");
+        if (launcherWin) await launcherWin.show().catch(() => {});
+        await getCurrentWebviewWindow().hide().catch(() => {});
+      });
+    }
+  }, [currentView, windowLabel]);
 
   const previousView = useMeetingStore((s) => s.previousView);
 
@@ -210,23 +294,53 @@ function App() {
 
   // Don't render until config is loaded from disk — prevents false wizard trigger
   if (!configLoaded) {
+    const loadingBg = windowLabel === "overlay" ? "bg-transparent" : "bg-background";
     return (
-      <div className="flex h-screen w-screen items-center justify-center bg-background">
-        <div className="flex flex-col items-center gap-3">
-          <div className="h-8 w-8 rounded-xl bg-primary/10 flex items-center justify-center">
-            <div className="h-3 w-3 rounded-full bg-primary/40 animate-pulse" />
+      <div className={`flex h-screen w-screen items-center justify-center ${loadingBg}`}>
+        {windowLabel !== "overlay" && (
+          <div className="flex flex-col items-center gap-3">
+            <div className="h-8 w-8 rounded-xl bg-primary/10 flex items-center justify-center">
+              <div className="h-3 w-3 rounded-full bg-primary/40 animate-pulse" />
+            </div>
+            <div className="text-sm text-muted-foreground">Starting NexQ...</div>
           </div>
-          <div className="text-sm text-muted-foreground">Starting NexQ...</div>
-        </div>
+        )}
       </div>
     );
   }
 
   // Determine which view to render
   const resolvedView: AppView = !firstRunCompleted ? "wizard" : currentView;
+  const isOverlayWindow = windowLabel === "overlay";
+  const isLauncherWindow = windowLabel === "launcher" || windowLabel === "";
+
+  // Overlay Tauri window: always transparent, uses currentView directly (ignores firstRunCompleted)
+  if (isOverlayWindow) {
+    return (
+      <div className="h-screen w-screen overflow-hidden bg-transparent text-foreground">
+        <ErrorBoundary fallbackMessage="NexQ encountered an error">
+          {currentView === "overlay" && (
+            <ErrorBoundary fallbackMessage="Failed to load overlay">
+              <div className="flex h-full">
+                <div className="flex-1 min-w-0 overflow-hidden">
+                  <OverlayView />
+                </div>
+                <CallLogPanel />
+              </div>
+            </ErrorBoundary>
+          )}
+          {(settingsOpen || currentView === "settings") && (
+            <SettingsOverlay isModal={currentView === "overlay"} />
+          )}
+        </ErrorBoundary>
+        <ActiveMeetingProvider isLauncherWindow={false} />
+        <ToastContainer />
+      </div>
+    );
+  }
 
   return (
-    <div className="h-screen w-screen overflow-hidden bg-background text-foreground">
+    <div className={`h-screen w-screen overflow-hidden text-foreground ${resolvedView === "overlay" ? "bg-transparent" : "bg-background"}`}>
       <ErrorBoundary fallbackMessage="NexQ encountered an error">
         {resolvedView === "launcher" && (
           <ErrorBoundary fallbackMessage="Failed to load launcher">
@@ -253,12 +367,9 @@ function App() {
             <SettingsOverlay />
           </ErrorBoundary>
         )}
-        {/* Settings modal for overlay view (during meetings) */}
         {settingsOpen && resolvedView === "overlay" && <SettingsOverlay isModal />}
       </ErrorBoundary>
-      {/* Runs transcription/timer/persistence hooks whenever a meeting is active,
-          regardless of which view is displayed */}
-      <ActiveMeetingProvider />
+      <ActiveMeetingProvider isLauncherWindow={isLauncherWindow} />
       <ToastContainer />
       <SelectionToolbar />
       {/* Call log panel is now integrated into the overlay flex layout above */}

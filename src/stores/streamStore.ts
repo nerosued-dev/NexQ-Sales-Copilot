@@ -1,5 +1,5 @@
 import { create } from "zustand";
-import type { AIResponse, IntelligenceMode } from "../lib/types";
+import type { AIResponse, IntelligenceMode, StreamSource } from "../lib/types";
 import { stripThinkTags } from "../lib/utils";
 
 interface StreamState {
@@ -10,6 +10,7 @@ interface StreamState {
   currentMode: IntelligenceMode | null;
   currentModel: string;
   currentProvider: string;
+  currentSources: StreamSource[];
   error: string | null;
   latencyMs: number | null;
 
@@ -21,6 +22,7 @@ interface StreamState {
   setStreaming: (streaming: boolean) => void;
   appendToken: (token: string) => void;
   startStream: (mode: IntelligenceMode, model: string, provider: string) => void;
+  setSources: (sources: StreamSource[]) => void;
   endStream: (latencyMs: number) => void;
   setError: (error: string | null) => void;
   clearCurrent: () => void;
@@ -35,6 +37,7 @@ export const useStreamStore = create<StreamState>((set, get) => ({
   currentMode: null,
   currentModel: "",
   currentProvider: "",
+  currentSources: [],
   error: null,
   latencyMs: null,
   responseHistory: [],
@@ -59,9 +62,12 @@ export const useStreamStore = create<StreamState>((set, get) => ({
       currentMode: mode,
       currentModel: model,
       currentProvider: provider,
+      currentSources: [],
       error: null,
       latencyMs: null,
     }),
+
+  setSources: (sources) => set({ currentSources: sources }),
 
   endStream: (latencyMs) => {
     const state = get();
@@ -76,6 +82,7 @@ export const useStreamStore = create<StreamState>((set, get) => ({
       model: state.currentModel,
       provider: state.currentProvider,
       latency_ms: latencyMs,
+      sources: state.currentSources.length > 0 ? state.currentSources : undefined,
     };
 
     set((s) => ({
@@ -88,7 +95,7 @@ export const useStreamStore = create<StreamState>((set, get) => ({
 
   setError: (error) => set({ error, isStreaming: false }),
   clearCurrent: () =>
-    set({ currentContent: "", _rawContent: "", currentMode: null, currentModel: "", currentProvider: "", error: null, latencyMs: null }),
+    set({ currentContent: "", _rawContent: "", currentMode: null, currentModel: "", currentProvider: "", currentSources: [], error: null, latencyMs: null }),
 
   pinResponse: (id) => {
     const state = get();

@@ -40,6 +40,7 @@ import {
   Columns2,
   PanelLeftClose,
   PanelRightClose,
+  Eye,
 } from "lucide-react";
 import { formatDuration } from "../lib/utils";
 
@@ -66,6 +67,13 @@ export function OverlayView() {
   const mutedThem = useConfigStore((s) => s.mutedThem);
   const toggleMuteYou = useConfigStore((s) => s.toggleMuteYou);
   const toggleMuteThem = useConfigStore((s) => s.toggleMuteThem);
+  const overlayOpacity = useConfigStore((s) => s.overlayOpacity);
+  const setOverlayOpacity = useConfigStore((s) => s.setOverlayOpacity);
+  const OPACITY_PRESETS = [0.9, 0.65, 0.35, 0.1];
+  const cycleOpacity = () => {
+    const idx = OPACITY_PRESETS.findIndex((p) => Math.abs(p - overlayOpacity) < 0.08);
+    setOverlayOpacity(OPACITY_PRESETS[(idx + 1) % OPACITY_PRESETS.length]);
+  };
 
   const autoTranslateActive = useTranslationStore((s) => s.autoTranslateActive);
   const setAutoTranslateActive = useTranslationStore((s) => s.setAutoTranslateActive);
@@ -131,7 +139,7 @@ export function OverlayView() {
   const meetingTitle = activeMeeting?.title || "NexQ";
 
   return (
-    <div className="overlay-bg flex h-full flex-col rounded-xl border border-border/20 shadow-xl">
+    <div className="overlay-bg flex h-full flex-col rounded-xl border border-border/20 shadow-xl" style={{ background: `hsl(var(--background) / ${overlayOpacity})`, backdropFilter: overlayOpacity > 0.7 ? "blur(12px) saturate(1.1)" : "none" }}>
 
       {/* ═══ HEADER ═══ */}
       <div
@@ -208,6 +216,7 @@ export function OverlayView() {
           <HeaderBtn icon={<Bookmark className="h-3.5 w-3.5" />} active={bookmarksOpen} onClick={() => setBookmarksOpen(p => !p)} tooltip="Bookmarks (K)" />
           <HeaderBtn icon={<Activity className="h-3.5 w-3.5" />} active={logOpen} onClick={toggleLog} tooltip="AI Call Log" />
           <HeaderBtn icon={<Terminal className="h-3.5 w-3.5" />} active={devLogOpen} onClick={() => setDevLogOpen(p => !p)} tooltip="Dev Log (Ctrl+Shift+L)" />
+          <HeaderBtn icon={<Eye className="h-3.5 w-3.5" />} onClick={cycleOpacity} tooltip={`Transparency: ${Math.round(overlayOpacity * 100)}% (click to cycle)`} />
           <HeaderBtn icon={<Settings className="h-3.5 w-3.5" />} onClick={() => setCurrentView("settings")} tooltip="Settings" />
           <HeaderBtn icon={<Minus className="h-3.5 w-3.5" />} onClick={() => setCurrentView("launcher")} tooltip="Minimize to Dashboard" />
 

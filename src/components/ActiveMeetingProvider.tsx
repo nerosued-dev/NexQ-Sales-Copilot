@@ -14,11 +14,11 @@ import { useCallLogCapture } from "../hooks/useCallLogCapture";
 import { useSTTStatus } from "../hooks/useSTTStatus";
 import { useDevLog } from "../hooks/useDevLog";
 
-export function ActiveMeetingProvider() {
+export function ActiveMeetingProvider({ isLauncherWindow = true }: { isLauncherWindow?: boolean }) {
   const activeMeeting = useMeetingStore((s) => s.activeMeeting);
 
-  // Only run hooks when there's an active meeting
-  if (!activeMeeting) return null;
+  // Persistence/audio hooks only run in the launcher window to avoid duplicate DB writes
+  if (!activeMeeting || !isLauncherWindow) return null;
 
   return <ActiveMeetingHooks />;
 }

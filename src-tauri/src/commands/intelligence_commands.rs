@@ -33,6 +33,9 @@ fn compose_instructions(presets: &InstructionPresets, custom: &str) -> String {
         };
         parts.push(text);
     }
+    if presets.opinion.as_deref() == Some("add") {
+        parts.push("After answering based on the provided context, add a short section '## My Take' with your own analysis, interpretation, or recommendation — clearly separated from the factual answer above.".to_string());
+    }
     let prefix = parts.join(" ");
     if !prefix.is_empty() && !custom.is_empty() {
         format!("{} {}", prefix, custom)
@@ -271,10 +274,13 @@ pub async fn generate_assist(
         }
     };
 
+    let enable_web_search = action_cfg.as_ref().map(|c| c.web_search).unwrap_or(false);
+
     let params = GenerationParams {
         temperature: Some(temperature),
         max_tokens: None,
         cache_name: active_cache_name.clone(),
+        enable_web_search,
     };
 
     // RAG metadata for StreamStartEvent

@@ -256,6 +256,15 @@ export const useMeetingStore = create<MeetingState>((set, get) => ({
 
       // 6. Switch to overlay view
       set({ currentView: "overlay" });
+
+      // 7. Notify overlay Tauri window to initialize meeting UI
+      import("@tauri-apps/api/event").then(({ emit }) => {
+        emit("nexq:meeting_started", {
+          meeting,
+          audioMode: resolvedMode,
+          aiScenario: resolvedScenario,
+        }).catch(() => {});
+      });
     } catch (err) {
       console.error("[meetingStore] Failed to start meeting:", err);
       throw err;
@@ -466,6 +475,11 @@ export const useMeetingStore = create<MeetingState>((set, get) => ({
 
     // 10. Switch to launcher
     set({ currentView: "launcher", previousView: null });
+
+    // Notify overlay Tauri window that meeting ended
+    import("@tauri-apps/api/event").then(({ emit }) => {
+      emit("nexq:meeting_ended", {}).catch(() => {});
+    });
   },
 
   loadRecentMeetings: async () => {
