@@ -112,12 +112,10 @@ function App() {
     import("@tauri-apps/api/webviewWindow").then(({ getCurrentWebviewWindow }) => {
       const label = getCurrentWebviewWindow().label;
       setWindowLabel(label);
-      // Overlay window: transparent CSS + transparent WebView2 background for real passthrough
+      // Overlay window: transparent CSS (tauri.conf.json already sets transparent:true)
       if (label === "overlay") {
         document.body.style.background = "transparent";
         document.documentElement.style.background = "transparent";
-        const win = getCurrentWebviewWindow();
-        win.setBackgroundColor([0, 0, 0, 0]).catch(() => {});
       }
     });
   }, []);

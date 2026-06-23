@@ -1482,6 +1482,7 @@ async fn create_stt_provider_for_party(
         }
         STTProviderType::WindowsNative => {
             use crate::stt::windows_native::WindowsNativeSTT;
+            let lang = get_stt_language(state);
             let mut provider = if config.is_input_device {
                 // IPolicyConfig already overrides system default to the selected device,
                 // so DirectMic mode correctly captures from non-default devices too
@@ -1490,6 +1491,7 @@ async fn create_stt_provider_for_party(
                 // System audio: feed PCM from pipeline
                 WindowsNativeSTT::for_custom_stream()
             };
+            provider.set_language(&lang);
             provider.set_app_handle(app.clone());
             provider.set_party(party_role);
             Ok(Some(Box::new(provider)))

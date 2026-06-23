@@ -702,6 +702,14 @@ fn run_windows_speech_recognizer(
             log::info!("WindowsNativeSTT: Auto-restarting session (#{}, backoff {}ms)", restart_count, backoff_ms);
             std::thread::sleep(std::time::Duration::from_millis(backoff_ms));
 
+            // StopAsync before StartAsync — after TimeoutExceeded/PauseLimitExceeded
+            // the session is in a completed state; calling StartAsync directly returns
+            // 0x80131509 (InvalidOperationException). StopAsync transitions it back to
+            // a startable state.
+            if let Ok(stop_op) = session.StopAsync() {
+                let _ = stop_op.get();
+            }
+
             match session.StartAsync() {
                 Ok(op) => match op.get() {
                     Ok(_) => {

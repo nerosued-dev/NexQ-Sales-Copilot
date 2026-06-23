@@ -11,6 +11,7 @@
  */
 
 import { useEffect, useRef } from "react";
+import { emit } from "@tauri-apps/api/event";
 import { useMeetingStore } from "../stores/meetingStore";
 import { useTranscriptStore } from "../stores/transcriptStore";
 import { useConfigStore } from "../stores/configStore";
@@ -172,7 +173,7 @@ export function useSpeechRecognition() {
           const speakerId = speakerLabel === "User" ? "you" : "them";
           const wordCount = transcript.split(/\s+/).filter(Boolean).length;
           useSpeakerStore.getState().updateStats(speakerId, wordCount, 0);
-          updateInterimRef.current({
+          const finalSeg = {
             id: segId,
             text: transcript,
             speaker: speakerLabel,
@@ -180,11 +181,14 @@ export function useSpeechRecognition() {
             timestamp_ms: now,
             is_final: true,
             confidence,
-          });
+          };
+          updateInterimRef.current(finalSeg);
+          // Broadcast to overlay window — it has its own Zustand store and needs events
+          emit("transcript_final", { segment: finalSeg }).catch(() => {});
           pushTranscript(transcript, speakerLabel, now, true).catch(() => {});
         } else {
           const speakerId = speakerLabel === "User" ? "you" : "them";
-          updateInterimRef.current({
+          const interimSeg = {
             id: segId,
             text: transcript,
             speaker: speakerLabel,
@@ -192,7 +196,10 @@ export function useSpeechRecognition() {
             timestamp_ms: Date.now(),
             is_final: false,
             confidence: 0,
-          });
+          };
+          updateInterimRef.current(interimSeg);
+          // Broadcast to overlay window
+          emit("transcript_update", { segment: interimSeg }).catch(() => {});
         }
       }
     };
