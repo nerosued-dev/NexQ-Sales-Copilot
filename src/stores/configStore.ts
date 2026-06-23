@@ -227,7 +227,6 @@ interface ConfigState {
   setAiResponseHPad: (v: number) => void;
   setAiResponseAlign: (align: "left" | "center" | "right") => void;
   setOverlayOpacity: (opacity: number) => void;
-  setSttLanguage: (language: string) => void;
   setShowPostMeetingTranslation: (enabled: boolean) => void;
   toggleOpenRouterFavorite: (id: string) => void;
   addOpenRouterRecentlyUsed: (id: string) => void;
@@ -583,14 +582,6 @@ export const useConfigStore = create<ConfigState>((set) => ({
     set({ overlayOpacity: opacity });
     persistValue("overlayOpacity", opacity);
   },
-  setSttLanguage: (language) => {
-    set({ sttLanguage: language });
-    persistValue("sttLanguage", language);
-    import("../lib/ipc").then(({ setSTTLanguage }) =>
-      setSTTLanguage(language)
-        .catch((e) => console.warn("[configStore] Failed to set STT language:", e))
-    );
-  },
   setShowPostMeetingTranslation: (enabled) => {
     set({ showPostMeetingTranslation: enabled });
     persistValue("showPostMeetingTranslation", enabled);
@@ -698,7 +689,6 @@ export const useConfigStore = create<ConfigState>((set) => ({
       const aiResponseHPad = await store.get<number>("aiResponseHPad");
       const aiResponseAlign = await store.get<string>("aiResponseAlign");
       const overlayOpacity = await store.get<number>("overlayOpacity");
-      const sttLanguage = await store.get<string>("sttLanguage");
       const showPostMeetingTranslation = await store.get<boolean>("showPostMeetingTranslation");
       const trayNotifications = await store.get<boolean>("trayNotifications");
       const trayAutoStart = await store.get<boolean>("trayAutoStart");
@@ -930,13 +920,6 @@ export const useConfigStore = create<ConfigState>((set) => ({
           loadedDualPass.longChunkSecs,
           loadedDualPass.pauseSecs,
         ).catch((e) => console.warn("[configStore] Failed to sync dual-pass config on load:", e))
-      );
-
-      // Sync persisted STT language to Rust backend on startup.
-      const loadedSttLanguage = sttLanguage ?? "en-US";
-      import("../lib/ipc").then(({ setSTTLanguage }) =>
-        setSTTLanguage(loadedSttLanguage)
-          .catch((e) => console.warn("[configStore] Failed to sync STT language on load:", e))
       );
 
       // Sync persisted Deepgram config to Rust backend on startup.
