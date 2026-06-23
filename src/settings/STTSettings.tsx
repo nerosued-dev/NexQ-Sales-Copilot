@@ -102,7 +102,7 @@ const PROVIDER_OPTIONS: ProviderOption[] = [
   {
     value: "parakeet_tdt",
     label: "Parakeet TDT",
-    description: "Best accuracy, offline, English",
+    description: "Best accuracy, offline, multilingual",
     requiresApiKey: false,
     isLocal: true,
     credentialKey: "",
@@ -278,6 +278,8 @@ export function STTSettings() {
   const setConfigSTTProvider = useConfigStore((s) => s.setSTTProvider);
   const meetingAudioConfig = useConfigStore((s) => s.meetingAudioConfig);
   const setMeetingAudioConfig = useConfigStore((s) => s.setMeetingAudioConfig);
+  const sttLanguage = useConfigStore((s) => s.sttLanguage);
+  const setSTTLanguage = useConfigStore((s) => s.setSTTLanguage);
   const activeWhisperModel = useConfigStore((s) => s.activeWhisperModel);
   // Persisted: providers whose key has been saved + tested successfully
   const verifiedCloudProviders = useConfigStore((s) => s.verifiedCloudProviders);
@@ -285,8 +287,6 @@ export function STTSettings() {
 
   const [selectedProvider, setSelectedProvider] =
     useState<STTProviderType>(sttProvider);
-  const sttLanguage = useConfigStore((s) => s.sttLanguage);
-  const setSttLanguage = useConfigStore((s) => s.setSttLanguage);
   const [apiKey, setApiKey] = useState("");
   const [showApiKey, setShowApiKey] = useState(false);
   const [hasStoredKey, setHasStoredKey] = useState(false);
@@ -300,6 +300,11 @@ export function STTSettings() {
   const [hasStoredRegion, setHasStoredRegion] = useState(false);
 
   const [localEngines, setLocalEngines] = useState<LocalSTTEngineInfo[]>([]);
+  const activeParakeetModel = useConfigStore((s) =>
+    s.activeModelPerEngine.parakeet_tdt ?? "parakeet-tdt-0.6b-v3-int8"
+  );
+  const parakeetCtcEnglishOnly =
+    activeParakeetModel.includes("ctc-110m") && !sttLanguage.toLowerCase().startsWith("en");
 
   const currentProviderOption = PROVIDER_OPTIONS.find(
     (p) => p.value === selectedProvider
@@ -745,7 +750,7 @@ export function STTSettings() {
         </h3>
         <select
           value={sttLanguage}
-          onChange={(e) => setSttLanguage(e.target.value)}
+          onChange={(e) => setSTTLanguage(e.target.value)}
           aria-label="STT language"
           className="w-full rounded-lg border border-border/50 bg-background px-3.5 py-2.5 text-sm text-foreground focus:border-primary focus:outline-none focus:ring-1 focus:ring-primary/20"
         >
@@ -755,6 +760,11 @@ export function STTSettings() {
             </option>
           ))}
         </select>
+        {selectedProvider === "parakeet_tdt" && parakeetCtcEnglishOnly && (
+          <p className="mt-2 text-xs text-warning">
+            Parakeet CTC 110M is English-only. Use Parakeet TDT 0.6B v3 for Russian and other supported languages.
+          </p>
+        )}
       </div>
 
       {/* Test Connection — only for local/always-ready providers; cloud uses Save & Test in the key section */}

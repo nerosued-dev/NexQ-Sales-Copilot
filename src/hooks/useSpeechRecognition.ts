@@ -133,10 +133,12 @@ export function useSpeechRecognition() {
 
     // Determine speaker label from config — symmetric for YOU and THEM
     const currentConfig = useConfigStore.getState().meetingAudioConfig;
+    const currentLanguage = sttLanguage || "en-US";
     const speakerLabel = getSpeakerLabel(currentConfig);
 
     console.log(
       "[STT] Web Speech starting | speaker:", speakerLabel,
+      "| Language:", currentLanguage,
       "| Config:",
       currentConfig
         ? `you=${currentConfig.you.stt_provider}, them=${currentConfig.them.stt_provider}`
@@ -147,7 +149,7 @@ export function useSpeechRecognition() {
     recognition.continuous = true;
     recognition.interimResults = true;
     recognition.maxAlternatives = 1;
-    recognition.lang = sttLanguage;
+    recognition.lang = currentLanguage;
 
     recognitionRef.current = recognition;
     shouldRestartRef.current = true;
@@ -270,7 +272,7 @@ export function useSpeechRecognition() {
               fresh.continuous = true;
               fresh.interimResults = true;
               fresh.maxAlternatives = 1;
-              fresh.lang = "en-US";
+              fresh.lang = useConfigStore.getState().sttLanguage || currentLanguage;
               // Copy handlers from old instance
               fresh.onresult = recognitionRef.current!.onresult;
               fresh.onerror = recognitionRef.current!.onerror;
