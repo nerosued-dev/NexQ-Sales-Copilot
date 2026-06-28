@@ -276,6 +276,8 @@ interface BadgeState { text: string; variant: BadgeVariant }
 export function STTSettings() {
   const sttProvider = useConfigStore((s) => s.sttProvider);
   const setConfigSTTProvider = useConfigStore((s) => s.setSTTProvider);
+  const meetingAudioConfig = useConfigStore((s) => s.meetingAudioConfig);
+  const setMeetingAudioConfig = useConfigStore((s) => s.setMeetingAudioConfig);
   const sttLanguage = useConfigStore((s) => s.sttLanguage);
   const setSTTLanguage = useConfigStore((s) => s.setSTTLanguage);
   const activeWhisperModel = useConfigStore((s) => s.activeWhisperModel);
@@ -425,11 +427,18 @@ export function STTSettings() {
       try {
         await setSTTProvider(provider);
         setConfigSTTProvider(provider);
+        // Sync meetingAudioConfig so useAudioConfigSync hot-swaps the live capture.
+        if (meetingAudioConfig) {
+          setMeetingAudioConfig({
+            ...meetingAudioConfig,
+            you: { ...meetingAudioConfig.you, stt_provider: provider },
+          });
+        }
       } catch (e) {
         console.error("Failed to set STT provider:", e);
       }
     },
-    [setConfigSTTProvider]
+    [setConfigSTTProvider, meetingAudioConfig, setMeetingAudioConfig]
   );
 
   /** Save & Test: test key first, only persist on success. */

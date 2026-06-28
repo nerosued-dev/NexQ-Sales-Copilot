@@ -7,6 +7,7 @@ import {
   onStreamStart,
   onStreamToken,
   onStreamEnd,
+  onStreamSources,
   onStreamError,
 } from "../lib/events";
 import type { IntelligenceMode } from "../lib/types";
@@ -20,6 +21,7 @@ export function useStreamBuffer() {
   const appendToken = useStreamStore((s) => s.appendToken);
   const startStream = useStreamStore((s) => s.startStream);
   const endStream = useStreamStore((s) => s.endStream);
+  const setSources = useStreamStore((s) => s.setSources);
   const setError = useStreamStore((s) => s.setError);
 
   // Token batching buffer
@@ -85,6 +87,13 @@ export function useStreamBuffer() {
       })
     );
 
+    // Subscribe to grounding sources (emitted before stream end, when web search is enabled)
+    unlisteners.push(
+      onStreamSources((event) => {
+        setSources(event.sources);
+      })
+    );
+
     // Subscribe to stream errors
     unlisteners.push(
       onStreamError((error) => {
@@ -104,5 +113,5 @@ export function useStreamBuffer() {
       }
       unlisteners.forEach((p) => p.then((unlisten) => unlisten()));
     };
-  }, [appendToken, startStream, endStream, setError]);
+  }, [appendToken, startStream, endStream, setSources, setError]);
 }

@@ -115,11 +115,8 @@
   background: hsl(var(--muted-foreground) / 0.35);
 }
 
-/* Overlay window transparent background */
-.overlay-bg {
-  background: hsl(var(--background) / 0.94);
-  backdrop-filter: blur(12px) saturate(1.1);
-}
+/* Overlay window transparent background — background + backdrop-filter applied inline */
+.overlay-bg {}
 
 /* Transcript interim text */
 .transcript-interim {

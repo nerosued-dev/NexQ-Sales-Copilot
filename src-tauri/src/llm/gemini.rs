@@ -7,7 +7,7 @@ use tauri::Emitter;
 
 use super::provider::{
     CompletionStats, GenerationParams, LLMError, LLMMessage, LLMProvider, ModelInfo,
-    StreamEndPayload, StreamTokenPayload,
+    StreamEndPayload, StreamSource, StreamSourcesPayload, StreamTokenPayload,
 };
 use super::stream_parser::{LineBuffer, SSEParser};
 
@@ -175,15 +175,29 @@ impl LLMProvider for GeminiClient {
             gen_config["temperature"] = json!(temp);
         }
 
-        let mut body = json!({
-            "contents": contents,
-            "generationConfig": gen_config
-        });
-
-        if let Some(system) = system_instruction {
-            body["systemInstruction"] = json!({
-                "parts": [{"text": system}]
+        let mut body = if let Some(cache_name) = &params.cache_name {
+            // Cache active: reference cached content, skip systemInstruction (it's in the cache).
+            // Only dynamic contents (transcript + question) are sent fresh.
+            json!({
+                "cachedContent": cache_name,
+                "contents": contents,
+                "generationConfig": gen_config
+            })
+        } else {
+            let mut b = json!({
+                "contents": contents,
+                "generationConfig": gen_config
             });
+            if let Some(system) = system_instruction {
+                b["systemInstruction"] = json!({
+                    "parts": [{"text": system}]
+                });
+            }
+            b
+        };
+
+        if params.enable_web_search {
+            body["tools"] = json!([{ "google_search": {} }]);
         }
 
         // NOTE: llm_stream_start is emitted by IntelligenceEngine::generate_assist()
@@ -218,6 +232,7 @@ impl LLMProvider for GeminiClient {
         let mut token_count: u64 = 0;
         let mut prompt_tokens: u64 = 0;
         let mut completion_tokens: u64 = 0;
+        let mut grounding_sources: Vec<(String, String)> = Vec::new();
 
         while let Some(chunk_result) = stream.next().await {
             let chunk = chunk_result.map_err(|e| {
@@ -244,6 +259,10 @@ impl LLMProvider for GeminiClient {
                                         },
                                     );
                                 }
+                            }
+
+                            if params.enable_web_search {
+                                grounding_sources.extend(SSEParser::extract_gemini_grounding(&data));
                             }
 
                             // Extract usage metadata if available
@@ -301,6 +320,16 @@ impl LLMProvider for GeminiClient {
             total_tokens: total,
             latency_ms,
         };
+
+        if !grounding_sources.is_empty() {
+            let mut seen = std::collections::HashSet::new();
+            let sources: Vec<StreamSource> = grounding_sources
+                .into_iter()
+                .filter(|(_, url)| seen.insert(url.clone()))
+                .map(|(title, url)| StreamSource { title, url })
+                .collect();
+            let _ = app_handle.emit("llm_stream_sources", StreamSourcesPayload { sources });
+        }
 
         let _ = app_handle.emit(
             "llm_stream_end",

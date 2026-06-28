@@ -63,13 +63,14 @@ function createDefaultConfigs(): AllActionConfigs {
       autoTrigger: true,
     },
     customInstructions: "",
-    instructionPresets: { tone: null, format: null, length: null },
+    instructionPresets: { tone: null, format: null, length: null, opinion: null },
     actions: {
       Assist: {
         id: "Assist", name: "Assist", mode: "Assist", visible: true,
         systemPrompt: DEFAULT_PROMPTS.Assist, isDefaultPrompt: true,
         includeTranscript: true, includeRagChunks: true,
         includeCustomInstructions: true, includeDetectedQuestion: true,
+        webSearch: false,
         transcriptWindowSeconds: null, ragTopK: null, temperature: null,
         isBuiltIn: true,
       },
@@ -78,6 +79,7 @@ function createDefaultConfigs(): AllActionConfigs {
         systemPrompt: DEFAULT_PROMPTS.WhatToSay, isDefaultPrompt: true,
         includeTranscript: true, includeRagChunks: false,
         includeCustomInstructions: true, includeDetectedQuestion: true,
+        webSearch: false,
         transcriptWindowSeconds: 60, ragTopK: null, temperature: null,
         isBuiltIn: true,
       },
@@ -86,6 +88,7 @@ function createDefaultConfigs(): AllActionConfigs {
         systemPrompt: DEFAULT_PROMPTS.Shorten, isDefaultPrompt: true,
         includeTranscript: true, includeRagChunks: false,
         includeCustomInstructions: true, includeDetectedQuestion: true,
+        webSearch: false,
         transcriptWindowSeconds: 30, ragTopK: null, temperature: null,
         isBuiltIn: true,
       },
@@ -94,6 +97,7 @@ function createDefaultConfigs(): AllActionConfigs {
         systemPrompt: DEFAULT_PROMPTS.FollowUp, isDefaultPrompt: true,
         includeTranscript: true, includeRagChunks: false,
         includeCustomInstructions: true, includeDetectedQuestion: false,
+        webSearch: false,
         transcriptWindowSeconds: null, ragTopK: null, temperature: null,
         isBuiltIn: true,
       },
@@ -102,6 +106,7 @@ function createDefaultConfigs(): AllActionConfigs {
         systemPrompt: DEFAULT_PROMPTS.Recap, isDefaultPrompt: true,
         includeTranscript: true, includeRagChunks: false,
         includeCustomInstructions: false, includeDetectedQuestion: false,
+        webSearch: false,
         transcriptWindowSeconds: 0, ragTopK: null, temperature: null,
         isBuiltIn: true,
       },
@@ -110,6 +115,7 @@ function createDefaultConfigs(): AllActionConfigs {
         systemPrompt: DEFAULT_PROMPTS.AskQuestion, isDefaultPrompt: true,
         includeTranscript: true, includeRagChunks: true,
         includeCustomInstructions: true, includeDetectedQuestion: false,
+        webSearch: true,
         transcriptWindowSeconds: null, ragTopK: null, temperature: null,
         isBuiltIn: true,
       },
@@ -137,6 +143,11 @@ function composeInstructions(presets: InstructionPresets, custom: string): strin
       detailed: "Detailed responses.",
     };
     parts.push(lengthMap[presets.length] || `${presets.length} responses.`);
+  }
+  if (presets.opinion === "add") {
+    parts.push(
+      "After answering based on the provided context, add a short section '## My Take' with your own analysis, interpretation, or recommendation — clearly separated from the factual answer above."
+    );
   }
   const prefix = parts.join(" ");
   if (prefix && custom) return `${prefix} ${custom}`;
@@ -279,6 +290,7 @@ export const useAIActionsStore = create<AIActionsState>((set, get) => ({
       includeRagChunks: true,
       includeCustomInstructions: true,
       includeDetectedQuestion: true,
+      webSearch: false,
       transcriptWindowSeconds: null,
       ragTopK: null,
       temperature: null,

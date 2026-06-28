@@ -2,6 +2,7 @@ import { useCallback } from "react";
 import { useConfigStore } from "../stores/configStore";
 import { FolderOpen, Sun, Moon, Monitor } from "lucide-react";
 import type { ThemeMode } from "../lib/types";
+import { Eye } from "lucide-react";
 
 export function GeneralSettings() {
   const theme = useConfigStore((s) => s.theme);
@@ -11,6 +12,8 @@ export function GeneralSettings() {
   const startOnLogin = useConfigStore((s) => s.startOnLogin);
   const setStartOnLogin = useConfigStore((s) => s.setStartOnLogin);
   const dataDirectory = useConfigStore((s) => s.dataDirectory);
+  const overlayOpacity = useConfigStore((s) => s.overlayOpacity);
+  const setOverlayOpacity = useConfigStore((s) => s.setOverlayOpacity);
 
   const handleChangeDataDir = useCallback(async () => {
     try {
@@ -130,6 +133,37 @@ export function GeneralSettings() {
         <p className="text-xs text-info/80">
           Context Window, Auto-Trigger, and AI instructions have moved to the <strong className="text-info">AI Actions</strong> tab.
         </p>
+      </div>
+
+      {/* Overlay Opacity */}
+      <div className="rounded-xl border border-border/30 bg-card/50 p-5">
+        <div className="flex items-center justify-between mb-3">
+          <div className="flex items-center gap-2">
+            <Eye className="h-3.5 w-3.5 text-muted-foreground" />
+            <div>
+              <label className="text-sm font-medium text-foreground">Overlay Transparency</label>
+              <p className="mt-0.5 text-xs text-muted-foreground">
+                How transparent the overlay background is
+              </p>
+            </div>
+          </div>
+          <span className="text-xs font-mono text-muted-foreground w-10 text-right">
+            {Math.round(overlayOpacity * 100)}%
+          </span>
+        </div>
+        <input
+          type="range"
+          min={0.1}
+          max={1}
+          step={0.01}
+          value={overlayOpacity}
+          onChange={(e) => setOverlayOpacity(parseFloat(e.target.value))}
+          className="w-full h-1.5 rounded-full appearance-none bg-secondary cursor-pointer accent-primary"
+        />
+        <div className="flex justify-between mt-1">
+          <span className="text-[10px] text-muted-foreground/50">Transparent</span>
+          <span className="text-[10px] text-muted-foreground/50">Solid</span>
+        </div>
       </div>
 
       {/* Data Directory */}

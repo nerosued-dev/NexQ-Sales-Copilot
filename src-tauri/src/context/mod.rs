@@ -120,19 +120,23 @@ impl ContextManager {
             .map(|m| m.len())
             .unwrap_or(0);
 
-        // Extract text based on file type
+        // Extract text based on file type — clean up copied file on failure
         let text = match file_type {
             "pdf" => pdf_extractor::extract_text_from_pdf(
                 dest_path.to_str().unwrap_or(file_path),
-            )?,
+            ),
             "txt" | "md" => file_loader::load_text_file(
                 dest_path.to_str().unwrap_or(file_path),
-            )?,
+            ),
             "docx" => crate::rag::file_processor::extract_docx_text(
                 dest_path.to_str().unwrap_or(file_path),
-            )?,
-            _ => String::new(),
-        };
+            ),
+            _ => Ok(String::new()),
+        }
+        .map_err(|e| {
+            let _ = fs::remove_file(&dest_path);
+            e
+        })?;
 
         // Count tokens
         let token_count = count_tokens(&text);

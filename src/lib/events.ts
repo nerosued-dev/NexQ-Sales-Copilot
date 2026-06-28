@@ -11,6 +11,7 @@ import type {
   QuestionDetectedEvent,
   RagIndexProgressEvent,
   StreamEndEvent,
+  StreamSourcesEvent,
   StreamStartEvent,
   StreamTokenEvent,
   TranscriptIndexedEvent,
@@ -60,6 +61,14 @@ export function onStreamEnd(
   handler: (event: StreamEndEvent) => void
 ): Promise<UnlistenFn> {
   return listen<StreamEndEvent>("llm_stream_end", (e) => handler(e.payload));
+}
+
+export function onStreamSources(
+  handler: (event: StreamSourcesEvent) => void
+): Promise<UnlistenFn> {
+  return listen<StreamSourcesEvent>("llm_stream_sources", (e) =>
+    handler(e.payload)
+  );
 }
 
 export function onStreamError(

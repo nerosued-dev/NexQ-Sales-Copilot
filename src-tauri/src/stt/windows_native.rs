@@ -261,7 +261,14 @@ impl STTProvider for WindowsNativeSTT {
 
 /// Check if Windows Speech Recognition is available for the given language.
 #[cfg(target_os = "windows")]
-fn check_speech_recognizer_available(_language: &str) -> bool {
+fn check_speech_recognizer_available(language: &str) -> bool {
+    use windows::core::HSTRING;
+    use windows::Globalization::Language;
+    use windows::Media::SpeechRecognition::{
+        SpeechRecognitionScenario,
+        SpeechRecognitionTopicConstraint,
+        SpeechRecognizer,
+    };
     use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
 
     unsafe {
@@ -270,8 +277,17 @@ fn check_speech_recognizer_available(_language: &str) -> bool {
             return false;
         }
 
-        // Try to access the SpeechRecognizer — if it works, the platform supports it
-        let available = windows::Media::SpeechRecognition::SpeechRecognizer::new().is_ok();
+        let available = (|| -> windows::core::Result<bool> {
+            let lang = Language::CreateLanguage(&HSTRING::from(language))?;
+            let recognizer = SpeechRecognizer::Create(&lang)?;
+            let constraint = SpeechRecognitionTopicConstraint::Create(
+                SpeechRecognitionScenario::Dictation,
+                &HSTRING::from("freeform"),
+            )?;
+            recognizer.Constraints()?.Append(&constraint)?;
+            recognizer.CompileConstraintsAsync()?.get()?;
+            Ok(true)
+        })().unwrap_or(false);
 
         CoUninitialize();
         available
@@ -375,28 +391,24 @@ fn run_windows_speech_recognizer(
         }
     }
 
-    // Create recognizer — try with specified language, fall back to default
+    // Create recognizer with the requested language.
+    emit_thread_status(app_handle, party, "info",
+        Some(format!("Windows Speech language: {}", language)));
+
     let recognizer = match (|| -> windows::core::Result<SpeechRecognizer> {
         let lang = Language::CreateLanguage(&HSTRING::from(language))?;
-        // Use Create with language parameter
         SpeechRecognizer::Create(&lang)
     })() {
         Ok(r) => r,
-        Err(_) => {
-            // Fall back to system default language
-            match SpeechRecognizer::new() {
-                Ok(r) => {
-                    log::info!("WindowsNativeSTT: Using system default language (requested '{}' unavailable)", language);
-                    r
-                }
-                Err(e) => {
-                    log::warn!("WindowsNativeSTT: Failed to create SpeechRecognizer: {}", e);
-                    emit_thread_status(app_handle, party, "error",
-                        Some(format!("Speech recognizer unavailable: {}. Install language pack in Settings > Time & Language.", e)));
-                    unsafe { windows::Win32::System::Com::CoUninitialize(); }
-                    return false;
-                }
-            }
+        Err(e) => {
+            log::warn!(
+                "WindowsNativeSTT: requested language '{}' unavailable: {}",
+                language, e
+            );
+            emit_thread_status(app_handle, party, "error",
+                Some(format!("Windows Speech language '{}' is unavailable. Install that speech language pack in Settings > Time & Language > Speech, or use Deepgram for this language.", language)));
+            unsafe { windows::Win32::System::Com::CoUninitialize(); }
+            return false;
         }
     };
 
@@ -701,6 +713,14 @@ fn run_windows_speech_recognizer(
             let backoff_ms = std::cmp::min(500 * (1u64 << (restart_count - 1).min(3)), 5000);
             log::info!("WindowsNativeSTT: Auto-restarting session (#{}, backoff {}ms)", restart_count, backoff_ms);
             std::thread::sleep(std::time::Duration::from_millis(backoff_ms));
+
+            // StopAsync before StartAsync — after TimeoutExceeded/PauseLimitExceeded
+            // the session is in a completed state; calling StartAsync directly returns
+            // 0x80131509 (InvalidOperationException). StopAsync transitions it back to
+            // a startable state.
+            if let Ok(stop_op) = session.StopAsync() {
+                let _ = stop_op.get();
+            }
 
             match session.StartAsync() {
                 Ok(op) => match op.get() {

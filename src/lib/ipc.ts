@@ -664,6 +664,38 @@ export async function setStealthMode(enabled: boolean): Promise<void> {
   return invoke("set_stealth_mode", { enabled });
 }
 
+// == IPC: Gemini Context Cache ==
+
+export interface GeminiCacheInfo {
+  name: string;
+  model: string;
+  expire_time: string;
+  total_token_count: number;
+}
+
+export async function createGeminiContextCache(
+  model: string,
+  ttlSecs: number,
+  systemPrompt?: string
+): Promise<GeminiCacheInfo> {
+  const result = await invoke<string>("create_gemini_context_cache", {
+    model,
+    ttlSecs,
+    systemPrompt,
+  });
+  return JSON.parse(result);
+}
+
+export async function deleteGeminiContextCache(): Promise<void> {
+  return invoke("delete_gemini_context_cache");
+}
+
+export async function getGeminiCacheStatus(): Promise<GeminiCacheInfo | null> {
+  const result = await invoke<string | null>("get_gemini_cache_status");
+  if (!result) return null;
+  return JSON.parse(result);
+}
+
 // == IPC: Updater ==
 
 export async function checkForUpdate(): Promise<UpdateInfo | null> {

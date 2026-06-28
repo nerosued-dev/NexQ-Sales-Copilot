@@ -56,6 +56,11 @@ const LENGTH_OPTIONS = [
   { label: "Detailed", value: "detailed" },
 ];
 
+const OPINION_OPTIONS = [
+  { label: "Factual only", value: null },
+  { label: "Add my take", value: "add" },
+];
+
 
 /** Help content for each setting — shown via HelpButton/HelpPanel toggle */
 const HELP: Record<string, { title: string; body: string }> = {
@@ -70,6 +75,10 @@ const HELP: Record<string, { title: string; body: string }> = {
   length: {
     title: "Length",
     body: "Adjusts response verbosity.\n\nBrief (1-2 sentences) \u2014 fast-paced calls, overlay readability\nStandard (3-5 sentences) \u2014 balanced detail for most meetings\nDetailed \u2014 thorough analysis when you have time to read",
+  },
+  opinion: {
+    title: "Perspective",
+    body: "Controls whether the AI adds its own analysis.\n\nFactual only \u2014 answers are grounded strictly in transcript/memory context, no interpretation (default)\nAdd my take \u2014 appends a short '## My Take' section with the AI's own analysis, interpretation, or recommendation after the factual answer",
   },
   instructions: {
     title: "Additional Instructions",
@@ -248,6 +257,13 @@ export function AIActionsSettings() {
     [configs.instructionPresets, setInstructionPresets]
   );
 
+  const handleOpinionChange = useCallback(
+    (value: string | null) => {
+      setInstructionPresets({ ...configs.instructionPresets, opinion: value });
+    },
+    [configs.instructionPresets, setInstructionPresets]
+  );
+
   const handleCustomInstructionsChange = useCallback(
     (text: string) => {
       setCustomInstructions(text);
@@ -347,6 +363,9 @@ export function AIActionsSettings() {
       };
       parts.push(lm[p.length] || `${p.length} responses.`);
     }
+    if (p.opinion === "add") {
+      parts.push("Adds a 'My Take' section with the AI's own analysis.");
+    }
     return parts.join(" ");
   }, [configs.instructionPresets]);
 
@@ -427,6 +446,30 @@ export function AIActionsSettings() {
                     onClick={() => handlePresetToggle("length", opt.value)}
                     className={`rounded-full px-3 py-1 text-xs font-medium cursor-pointer transition-colors duration-150 ${
                       configs.instructionPresets.length === opt.value
+                        ? "bg-primary/20 text-primary ring-1 ring-primary/20"
+                        : "text-muted-foreground hover:bg-accent/50"
+                    }`}
+                  >
+                    {opt.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {/* Perspective */}
+            <div>
+              <label className="flex items-center gap-1.5 text-xs font-medium text-muted-foreground">
+                Perspective
+                <HelpButton id="opinion" activeId={openHelp} onToggle={toggleHelp} />
+              </label>
+              {openHelp === "opinion" && <HelpPanel id="opinion" />}
+              <div className="mt-2 flex flex-wrap gap-1.5">
+                {OPINION_OPTIONS.map((opt) => (
+                  <button
+                    key={opt.label}
+                    onClick={() => handleOpinionChange(opt.value)}
+                    className={`rounded-full px-3 py-1 text-xs font-medium cursor-pointer transition-colors duration-150 ${
+                      (configs.instructionPresets.opinion ?? null) === opt.value
                         ? "bg-primary/20 text-primary ring-1 ring-primary/20"
                         : "text-muted-foreground hover:bg-accent/50"
                     }`}
@@ -852,6 +895,7 @@ function ActionCard({
                 { key: "includeRagChunks", label: "RAG Chunks", checked: action.includeRagChunks },
                 { key: "includeCustomInstructions", label: "Custom Instructions", checked: action.includeCustomInstructions },
                 { key: "includeDetectedQuestion", label: "Detected Question", checked: action.includeDetectedQuestion },
+                { key: "webSearch", label: "Web Search", checked: action.webSearch },
               ].map(({ key, label, checked }) => (
                 <label key={key} className="flex items-center gap-2 cursor-pointer">
                   <input

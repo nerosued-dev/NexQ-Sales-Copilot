@@ -1,6 +1,6 @@
 [package]
 name = "nexq"
-version = "2.20.8"
+version = "2.20.10"
 description = "AI Meeting Assistant & Real-Time Interview Copilot"
 authors = ["NexQ"]
 edition = "2021"
@@ -39,6 +39,7 @@ env_logger = "0.11"
 cpal = "0.15"
 hound = "3.5"
 pdf-extract = "0.7"
+lopdf = "0.32"
 tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
 url = "2"
 base64 = "0.22"
@@ -54,6 +55,7 @@ bzip2 = "0.5"
 ogg = "0.9"
 libopus_sys = { version = "0.3", features = ["static", "bundled"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
+encoding_rs = "0.8"
 
 # Windows-specific
 [target.'cfg(windows)'.dependencies]
@@ -80,5 +82,6 @@ windows = { version = "0.58", features = [
     "Win32_UI_Shell_PropertiesSystem",
     "Win32_System_Com_StructuredStorage",
     "Win32_System_Variant",
+    "Win32_System_LibraryLoader",
 ] }
 wasapi = "0.22"

@@ -7,11 +7,12 @@ import {
   PinOff,
   Copy,
   Check,
+  Globe,
 } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { getModeLabel } from "../lib/utils";
-import type { AIResponse } from "../lib/types";
+import type { AIResponse, StreamSource } from "../lib/types";
 import { useConfigStore } from "../stores/configStore";
 import { ColorPickerButton } from "../components/ColorPickerButton";
 
@@ -23,6 +24,7 @@ export function AIResponsePanel() {
   const currentContent = useStreamStore((s) => s.currentContent);
   const currentMode = useStreamStore((s) => s.currentMode);
   const error = useStreamStore((s) => s.error);
+  const currentSources = useStreamStore((s) => s.currentSources);
   const responseHistory = useStreamStore((s) => s.responseHistory);
   const pinnedResponses = useStreamStore((s) => s.pinnedResponses);
   const pinResponse = useStreamStore((s) => s.pinResponse);
@@ -30,8 +32,23 @@ export function AIResponsePanel() {
 
   const aiResponseFontSize = useConfigStore((s) => s.aiResponseFontSize ?? 12);
   const aiResponseTextColor = useConfigStore((s) => s.aiResponseTextColor ?? "#d4d4d8");
+  const aiResponseLineHeight = useConfigStore((s) => s.aiResponseLineHeight ?? 1.6);
+  const aiResponseHPad = useConfigStore((s) => s.aiResponseHPad ?? 0);
+  const aiResponseAlign = useConfigStore((s) => s.aiResponseAlign ?? "left");
   const setAiResponseFontSize = useConfigStore((s) => s.setAiResponseFontSize);
   const setAiResponseTextColor = useConfigStore((s) => s.setAiResponseTextColor);
+  const setAiResponseLineHeight = useConfigStore((s) => s.setAiResponseLineHeight);
+  const setAiResponseHPad = useConfigStore((s) => s.setAiResponseHPad);
+  const setAiResponseAlign = useConfigStore((s) => s.setAiResponseAlign);
+
+  const proseStyle = {
+    fontSize: `${aiResponseFontSize}px`,
+    color: aiResponseTextColor,
+    lineHeight: aiResponseLineHeight,
+    paddingLeft: `${aiResponseHPad}px`,
+    paddingRight: `${aiResponseHPad}px`,
+    textAlign: aiResponseAlign as React.CSSProperties["textAlign"],
+  };
 
   const [activeTab, setActiveTab] = useState<TabId>("current");
   const [copiedId, setCopiedId] = useState<string | null>(null);
@@ -149,7 +166,7 @@ export function AIResponsePanel() {
                 {currentMode ? getModeLabel(currentMode) : "Generating"}...
               </span>
             </div>
-            <div className="prose prose-sm prose-invert max-w-none leading-relaxed" style={{ fontSize: `${aiResponseFontSize}px`, color: aiResponseTextColor }}>
+            <div className="prose prose-sm prose-invert max-w-none leading-relaxed" style={proseStyle}>
               <ReactMarkdown remarkPlugins={[remarkGfm]}>
                 {currentContent}
               </ReactMarkdown>
@@ -195,11 +212,12 @@ export function AIResponsePanel() {
                 </div>
               </div>
             )}
-            <div className="prose prose-sm prose-invert max-w-none leading-relaxed" style={{ fontSize: `${aiResponseFontSize}px`, color: aiResponseTextColor }}>
+            <div className="prose prose-sm prose-invert max-w-none leading-relaxed" style={proseStyle}>
               <ReactMarkdown remarkPlugins={[remarkGfm]}>
                 {currentContent}
               </ReactMarkdown>
             </div>
+            <SourcesList sources={currentSources} />
           </div>
         )}
 
@@ -234,11 +252,12 @@ export function AIResponsePanel() {
                 />
               </div>
             </div>
-            <div className="prose prose-sm prose-invert max-w-none leading-relaxed" style={{ fontSize: `${aiResponseFontSize}px`, color: aiResponseTextColor }}>
+            <div className="prose prose-sm prose-invert max-w-none leading-relaxed" style={proseStyle}>
               <ReactMarkdown remarkPlugins={[remarkGfm]}>
                 {displayContent}
               </ReactMarkdown>
             </div>
+            <SourcesList sources={displayResponse.sources} />
           </div>
         )}
 
@@ -255,20 +274,74 @@ export function AIResponsePanel() {
       </div>
 
       {/* Typeset controls */}
-      <div className="flex shrink-0 items-center gap-3 px-1 pt-1.5 border-t border-border/10">
-        <span className="text-[0.6rem] uppercase tracking-widest text-muted-foreground/40 font-medium">AI Text</span>
-        <div className="flex items-center gap-1">
-          <button onClick={() => setAiResponseFontSize(Math.max(10, aiResponseFontSize - 1))} className="h-5 w-5 flex items-center justify-center rounded text-[0.6rem] text-muted-foreground/50 hover:bg-accent/40 hover:text-foreground/70 transition-colors" title="Smaller">A</button>
-          <span className="text-[0.6rem] tabular-nums text-muted-foreground/50 w-6 text-center">{aiResponseFontSize}</span>
-          <button onClick={() => setAiResponseFontSize(Math.min(20, aiResponseFontSize + 1))} className="h-5 w-5 flex items-center justify-center rounded text-[0.75rem] font-medium text-muted-foreground/50 hover:bg-accent/40 hover:text-foreground/70 transition-colors" title="Larger">A</button>
+      <div className="flex shrink-0 flex-col gap-1 border-t border-border/10 px-1 pt-1.5">
+        {/* Row 1: font size + color */}
+        <div className="flex items-center gap-3">
+          <span className="text-[0.6rem] uppercase tracking-widest text-muted-foreground/40 font-medium">AI Text</span>
+          <div className="flex items-center gap-1">
+            <button onClick={() => setAiResponseFontSize(Math.max(8, aiResponseFontSize - 1))} className="h-5 w-5 flex items-center justify-center rounded text-[0.6rem] text-muted-foreground/50 hover:bg-accent/40 hover:text-foreground/70 transition-colors" title="Smaller">A</button>
+            <span className="text-[0.6rem] tabular-nums text-muted-foreground/50 w-6 text-center">{aiResponseFontSize}</span>
+            <button onClick={() => setAiResponseFontSize(Math.min(32, aiResponseFontSize + 1))} className="h-5 w-5 flex items-center justify-center rounded text-[0.75rem] font-medium text-muted-foreground/50 hover:bg-accent/40 hover:text-foreground/70 transition-colors" title="Larger">A</button>
+          </div>
+          <ColorPickerButton value={aiResponseTextColor} onChange={setAiResponseTextColor} label="AI text color" />
         </div>
-        <ColorPickerButton value={aiResponseTextColor} onChange={setAiResponseTextColor} label="AI text color" />
+        {/* Row 2: line height + horizontal padding + text align */}
+        <div className="flex items-center gap-3">
+          {/* Line height */}
+          <div className="flex items-center gap-1">
+            <span className="text-[0.6rem] text-muted-foreground/40">LH</span>
+            <button onClick={() => setAiResponseLineHeight(Math.max(1.0, parseFloat((aiResponseLineHeight - 0.1).toFixed(1))))} className="h-5 w-5 flex items-center justify-center rounded text-[0.65rem] text-muted-foreground/50 hover:bg-accent/40 hover:text-foreground/70 transition-colors" title="Decrease line height">−</button>
+            <span className="text-[0.6rem] tabular-nums text-muted-foreground/50 w-6 text-center">{aiResponseLineHeight.toFixed(1)}</span>
+            <button onClick={() => setAiResponseLineHeight(Math.min(3.0, parseFloat((aiResponseLineHeight + 0.1).toFixed(1))))} className="h-5 w-5 flex items-center justify-center rounded text-[0.65rem] text-muted-foreground/50 hover:bg-accent/40 hover:text-foreground/70 transition-colors" title="Increase line height">+</button>
+          </div>
+          {/* Horizontal padding */}
+          <div className="flex items-center gap-1">
+            <span className="text-[0.6rem] text-muted-foreground/40">↔</span>
+            <button onClick={() => setAiResponseHPad(Math.max(0, aiResponseHPad - 4))} className="h-5 w-5 flex items-center justify-center rounded text-[0.65rem] text-muted-foreground/50 hover:bg-accent/40 hover:text-foreground/70 transition-colors" title="Decrease margin">−</button>
+            <span className="text-[0.6rem] tabular-nums text-muted-foreground/50 w-6 text-center">{aiResponseHPad}</span>
+            <button onClick={() => setAiResponseHPad(Math.min(80, aiResponseHPad + 4))} className="h-5 w-5 flex items-center justify-center rounded text-[0.65rem] text-muted-foreground/50 hover:bg-accent/40 hover:text-foreground/70 transition-colors" title="Increase margin">+</button>
+          </div>
+          {/* Text align */}
+          <div className="flex items-center gap-0.5 rounded border border-border/20 overflow-hidden">
+            {(["left", "center", "right"] as const).map((a) => (
+              <button
+                key={a}
+                onClick={() => setAiResponseAlign(a)}
+                className={`px-1.5 py-0.5 text-[0.6rem] font-medium transition-colors ${aiResponseAlign === a ? "bg-primary/20 text-primary" : "text-muted-foreground/40 hover:text-muted-foreground/70"}`}
+                title={`Align ${a}`}
+              >
+                {a === "left" ? "L" : a === "center" ? "C" : "R"}
+              </button>
+            ))}
+          </div>
+        </div>
       </div>
     </div>
   );
 }
 
 // --- Sub-components ---
+
+function SourcesList({ sources }: { sources?: StreamSource[] }) {
+  if (!sources || sources.length === 0) return null;
+  return (
+    <div className="flex flex-wrap items-center gap-1.5 border-t border-border/10 pt-2">
+      <Globe className="h-3 w-3 shrink-0 text-muted-foreground/40" aria-hidden="true" />
+      {sources.map((source, idx) => (
+        <a
+          key={`${source.url}-${idx}`}
+          href={source.url}
+          target="_blank"
+          rel="noopener noreferrer"
+          title={source.url}
+          className="max-w-[14rem] truncate rounded-full bg-accent/30 px-2 py-0.5 text-meta text-muted-foreground/70 hover:bg-accent/50 hover:text-foreground/80 transition-colors"
+        >
+          {source.title}
+        </a>
+      ))}
+    </div>
+  );
+}
 
 function TabButton({
   label,

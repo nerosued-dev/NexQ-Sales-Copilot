@@ -38,6 +38,7 @@
 - **Dual-party transcription** — captures mic ("You") and system audio ("Them") simultaneously
 - **Real-time AI copilot** — get streaming answers, follow-up suggestions, and meeting recaps from 8 LLM providers
 - **Local RAG pipeline** — index your own documents (PDF, DOCX, TXT, MD) for context-aware AI responses
+- **Gemini Context Cache** — upload documents to Gemini once, skip local embedding entirely for ~3-5s faster queries
 - **10 STT providers** — Web Speech API, Deepgram, Groq, Whisper, ONNX Runtime, and more
 - **Always-on-top overlay** — compact, transparent floating window visible only to you
 - **Bookmarks & action items** — pin key moments and auto-extract tasks
@@ -53,6 +54,30 @@
 3. **Start** any meeting — NexQ captures system audio automatically
 
 [Getting Started Guide](docs/user-guide/getting-started.md) | [All User Guides](docs/user-guide/)
+
+## Gemini Context Cache
+
+For users running NexQ on a laptop without a dedicated GPU, local embedding can add 2–5 seconds of latency per AI query. The **Gemini Context Cache** feature eliminates this entirely.
+
+Instead of embedding documents locally via Ollama on every query, NexQ uploads your context documents to Gemini's servers once per meeting session. Gemini pre-processes and stores the KV state. Every subsequent query skips local embedding completely — only the live transcript and your question are sent fresh.
+
+**Setup:**
+1. Load your context documents (PDF, DOCX, TXT) in the Context panel
+2. Go to **Settings → Context Strategy**
+3. Select **Gemini Context Cache**
+4. Choose your model and TTL, then click **Create Cache from Context Docs**
+
+**Requirements:** Google Gemini API key, documents loaded in context.
+
+**Speed comparison (CPU-only laptop):**
+
+| Mode | Per-query overhead | Notes |
+|------|-------------------|-------|
+| Local RAG (`all-minilm`) | ~1–2s | Fastest local option |
+| Local RAG (`nomic-embed-text`) | ~3–5s | Default model |
+| **Gemini Context Cache** | **~0s** | No local embedding at all |
+
+Cache expires after your chosen TTL (30 min – 24 hours). Delete it early from the same settings panel.
 
 ## Why NexQ vs. Others?
 

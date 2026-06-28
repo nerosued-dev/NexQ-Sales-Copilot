@@ -71,23 +71,44 @@ fn model_char_limit(model: &str) -> usize {
         // mxbai-embed-large: 512 subword tokens
         1_700
     } else if m.contains("nomic-embed-text") {
-        // nomic-embed-text: 8192 subword tokens
+        // nomic-embed-text base: 2048 subword tokens.
+        // Spanish text ~2 bytes/BPE token → safe limit ~2400 chars
+        2_400
+    } else if m.contains("bge-large") || m.contains("bge-base") {
+        // BGE models: 512 subword tokens
+        1_700
+    } else if m.contains("bge-small") || m.contains("bge-micro") {
+        800
+    } else if m.contains("e5-large") || m.contains("e5-base") {
+        1_700
+    } else if m.contains("e5-small") {
+        800
+    } else if m.contains("jina") {
+        // jina-embeddings: 8192 subword tokens
         28_000
     } else {
-        // Conservative default for unknown models (assume 512 token context)
-        1_700
+        // Conservative default for unknown models — assume 256 subword tokens to be safe.
+        // Spanish/accented text uses more BPE tokens per char than ASCII.
+        800
     }
 }
 
-/// Truncate text to at most `max_chars` characters, breaking at the last word boundary.
+/// Truncate text to at most `max_chars` **bytes**, always on a valid UTF-8 char boundary.
 fn truncate_text(text: &str, max_chars: usize) -> &str {
     if text.len() <= max_chars {
         return text;
     }
-    // Prefer breaking at a whitespace boundary to avoid splitting a word
-    let boundary = text[..max_chars]
+    // Find the largest valid UTF-8 byte boundary that fits within max_chars bytes
+    let safe_end = text
+        .char_indices()
+        .take_while(|(i, _)| *i < max_chars)
+        .last()
+        .map(|(i, c)| i + c.len_utf8())
+        .unwrap_or(0);
+    // Prefer breaking at whitespace to avoid splitting a word
+    let boundary = text[..safe_end]
         .rfind(|c: char| c.is_whitespace())
-        .unwrap_or(max_chars);
+        .unwrap_or(safe_end);
     text[..boundary].trim_end()
 }
 
@@ -117,46 +138,62 @@ impl OllamaEmbedder {
         model: &str,
     ) -> Result<Vec<Vec<f32>>, String> {
         let url = format!("{}/api/embed", self.base_url);
-        let char_limit = model_char_limit(model);
+        let base_limit = model_char_limit(model);
 
-        // Truncate any text that would exceed the model's context window
-        let safe_texts: Vec<String> = texts
-            .iter()
-            .map(|t| truncate_text(t, char_limit).to_string())
-            .collect();
+        // Retry with progressively halved char limit on 400 "input length" errors.
+        // Handles models whose real BPE token count per char is higher than estimated
+        // (common with Spanish/accented text on smaller context models).
+        let mut char_limit = base_limit;
 
-        let request_body = EmbedRequest {
-            model: model.to_string(),
-            input: safe_texts,
-        };
+        loop {
+            let safe_texts: Vec<String> = texts
+                .iter()
+                .map(|t| truncate_text(t, char_limit.max(64)).to_string())
+                .collect();
 
-        let response = self
-            .client
-            .post(&url)
-            .json(&request_body)
-            .timeout(Duration::from_secs(120))
-            .send()
-            .await
-            .map_err(|e| format!("Ollama embed request failed: {}", e))?;
+            let request_body = EmbedRequest {
+                model: model.to_string(),
+                input: safe_texts,
+            };
 
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response
-                .text()
+            let response = self
+                .client
+                .post(&url)
+                .json(&request_body)
+                .timeout(Duration::from_secs(120))
+                .send()
                 .await
-                .unwrap_or_else(|_| "no body".to_string());
-            return Err(format!(
-                "Ollama embed returned status {}: {}",
-                status, body
-            ));
+                .map_err(|e| format!("Ollama embed request failed: {}", e))?;
+
+            if response.status().as_u16() == 400 {
+                let body = response.text().await.unwrap_or_default();
+                if body.contains("input length") || body.contains("context length") {
+                    if char_limit <= 64 {
+                        return Err(format!("Ollama embed returned status 400 Bad Request: {}", body));
+                    }
+                    char_limit /= 2;
+                    log::warn!(
+                        "Ollama embed 400 context exceeded, retrying at char_limit={}. model={}",
+                        char_limit, model
+                    );
+                    continue;
+                }
+                return Err(format!("Ollama embed returned status 400 Bad Request: {}", body));
+            }
+
+            if !response.status().is_success() {
+                let status = response.status();
+                let body = response.text().await.unwrap_or_else(|_| "no body".to_string());
+                return Err(format!("Ollama embed returned status {}: {}", status, body));
+            }
+
+            let embed_response: EmbedResponse = response
+                .json()
+                .await
+                .map_err(|e| format!("Failed to parse embed response: {}", e))?;
+
+            return Ok(embed_response.embeddings);
         }
-
-        let embed_response: EmbedResponse = response
-            .json()
-            .await
-            .map_err(|e| format!("Failed to parse embed response: {}", e))?;
-
-        Ok(embed_response.embeddings)
     }
 
     /// Embed a single query text with the "search_query: " prefix.

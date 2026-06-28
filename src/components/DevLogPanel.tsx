@@ -99,6 +99,9 @@ export function DevLogFullPage() {
   );
 }
 
+const FILTER_CATEGORIES = ["all", "speaker", "stt", "audio", "config", "rag"] as const;
+type FilterCategory = (typeof FILTER_CATEGORIES)[number];
+
 /** Shared content used by both inline panel and detached window. */
 function DevLogContent({
   onClose,
@@ -111,6 +114,7 @@ function DevLogContent({
   const clear = useDevLogStore((s) => s.clear);
   const scrollRef = useRef<HTMLDivElement>(null);
   const autoScrollRef = useRef(true);
+  const [filterCategory, setFilterCategory] = useState<FilterCategory>("all");
 
   // Auto-scroll when new entries arrive
   useEffect(() => {
@@ -135,15 +139,19 @@ function DevLogContent({
     return () => window.removeEventListener("keydown", handler);
   }, [onClose]);
 
+  const filteredEntries = filterCategory === "all"
+    ? entries
+    : entries.filter((e) => e.source === filterCategory);
+
   const handleCopyAll = useCallback(() => {
-    const text = entries
+    const text = filteredEntries
       .map(
         (e) =>
           `[${e.timestamp.toLocaleTimeString()}] [${e.level.toUpperCase()}] [${e.source}] ${e.message}`
       )
       .join("\n");
     navigator.clipboard.writeText(text);
-  }, [entries]);
+  }, [filteredEntries]);
 
   return (
     <>
@@ -152,9 +160,23 @@ function DevLogContent({
         <span className="text-meta font-semibold uppercase tracking-wider text-muted-foreground/70">
           Dev Log
         </span>
-        <div className="flex items-center gap-1">
+        <div className="flex items-center gap-1.5">
+          {/* Category filter buttons */}
+          {FILTER_CATEGORIES.map((cat) => (
+            <button
+              key={cat}
+              onClick={() => setFilterCategory(cat)}
+              className={`rounded px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide transition-colors cursor-pointer ${
+                filterCategory === cat
+                  ? "bg-primary/20 text-primary"
+                  : "text-muted-foreground/50 hover:text-foreground"
+              }`}
+            >
+              {cat}
+            </button>
+          ))}
           <span className="text-meta tabular-nums text-muted-foreground/60">
-            {entries.length} entries
+            {filteredEntries.length}/{entries.length}
           </span>
           <button
             onClick={handleCopyAll}
@@ -197,12 +219,12 @@ function DevLogContent({
         onScroll={handleScroll}
         className="flex-1 overflow-y-auto p-1.5 font-mono text-meta leading-relaxed"
       >
-        {entries.length === 0 ? (
+        {filteredEntries.length === 0 ? (
           <div className="flex h-full min-h-[60px] items-center justify-center text-muted-foreground/60">
-            Waiting for speech events...
+            {entries.length === 0 ? "Waiting for speech events..." : `No ${filterCategory} entries`}
           </div>
         ) : (
-          entries.map((entry) => (
+          filteredEntries.map((entry) => (
             <div
               key={entry.id}
               className="flex gap-1.5 rounded px-1 py-0.5 hover:bg-accent/20"

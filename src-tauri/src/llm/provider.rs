@@ -7,6 +7,14 @@ use thiserror::Error;
 pub struct GenerationParams {
     pub temperature: Option<f64>,
     pub max_tokens: Option<u64>,
+    /// Gemini context cache name (e.g. "cachedContents/abc123").
+    /// When set, GeminiClient uses the cached content instead of re-sending documents.
+    /// Ignored by all other providers.
+    pub cache_name: Option<String>,
+    /// When true, enable provider-native web search/grounding.
+    /// Gemini: adds the `google_search` tool. OpenRouter: appends `:online` to the model id.
+    /// Ignored by providers without a native web search mechanism.
+    pub enable_web_search: bool,
 }
 
 impl Default for GenerationParams {
@@ -14,6 +22,8 @@ impl Default for GenerationParams {
         Self {
             temperature: None,
             max_tokens: None,
+            cache_name: None,
+            enable_web_search: false,
         }
     }
 }
@@ -118,6 +128,19 @@ pub struct StreamTokenPayload {
 pub struct StreamEndPayload {
     pub total_tokens: u64,
     pub latency_ms: u64,
+}
+
+/// A single web search result/source surfaced by provider-native grounding (e.g. Gemini).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StreamSource {
+    pub title: String,
+    pub url: String,
+}
+
+/// Emitted once, after streaming completes, when the provider returned grounding sources.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StreamSourcesPayload {
+    pub sources: Vec<StreamSource>,
 }
 
 /// Trait that all LLM providers implement.

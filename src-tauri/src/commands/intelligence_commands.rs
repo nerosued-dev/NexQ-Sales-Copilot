@@ -33,6 +33,9 @@ fn compose_instructions(presets: &InstructionPresets, custom: &str) -> String {
         };
         parts.push(text);
     }
+    if presets.opinion.as_deref() == Some("add") {
+        parts.push("After answering based on the provided context, add a short section '## My Take' with your own analysis, interpretation, or recommendation — clearly separated from the factual answer above.".to_string());
+    }
     let prefix = parts.join(" ");
     if !prefix.is_empty() && !custom.is_empty() {
         format!("{} {}", prefix, custom)
@@ -252,9 +255,32 @@ pub async fn generate_assist(
         .as_ref()
         .and_then(|c| c.temperature)
         .unwrap_or(global_defaults.temperature);
+
+    // Check for active Gemini context cache — only applies when Gemini is the provider
+    let active_cache_name = {
+        let is_gemini = state.llm.as_ref()
+            .and_then(|l| l.lock().ok())
+            .and_then(|r| r.active_provider_type().cloned())
+            .map(|pt| pt == crate::llm::ProviderType::Gemini)
+            .unwrap_or(false);
+
+        if is_gemini {
+            state.gemini_cache
+                .lock()
+                .ok()
+                .and_then(|slot| slot.as_ref().map(|c| c.name.clone()))
+        } else {
+            None
+        }
+    };
+
+    let enable_web_search = action_cfg.as_ref().map(|c| c.web_search).unwrap_or(false);
+
     let params = GenerationParams {
         temperature: Some(temperature),
         max_tokens: None,
+        cache_name: active_cache_name.clone(),
+        enable_web_search,
     };
 
     // RAG metadata for StreamStartEvent
@@ -266,7 +292,9 @@ pub async fn generate_assist(
     let context_text = {
         let mut parts: Vec<String> = Vec::new();
 
-        if include_rag {
+        // When Gemini cache is active, skip RAG entirely — no Ollama embed needed.
+        // The full context is already cached on Gemini servers.
+        if include_rag && active_cache_name.is_none() {
             // Note: we don't check config.enabled here — the action-level include_rag
             // toggle is the user's intent. If they enabled RAG for this action and have
             // indexed files, we should search. (config.enabled defaults to false and is

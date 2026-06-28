@@ -11,10 +11,10 @@
  */
 
 import { useEffect, useRef } from "react";
+import { emit } from "@tauri-apps/api/event";
 import { useMeetingStore } from "../stores/meetingStore";
 import { useTranscriptStore } from "../stores/transcriptStore";
 import { useConfigStore } from "../stores/configStore";
-import { useSpeakerStore } from "../stores/speakerStore";
 import { pushTranscript, ensureIpolicyOverride } from "../lib/ipc";
 
 // Web Speech API types (not in all TS libs)
@@ -78,6 +78,7 @@ function getSpeakerLabel(cfg: ReturnType<typeof useConfigStore.getState>["meetin
  */
 export function useSpeechRecognition() {
   const isRecording = useMeetingStore((s) => s.isRecording);
+  const sttLanguage = useConfigStore((s) => s.sttLanguage);
 
   const audioMode = useMeetingStore((s) => s.audioMode);
 
@@ -95,7 +96,6 @@ export function useSpeechRecognition() {
     }
     return youIsWebSpeech || themIsWebSpeech;
   });
-  const sttLanguage = useConfigStore((s) => s.sttLanguage);
 
   // Ref for store action — always fresh without being a dep.
   const updateInterimRef = useRef(useTranscriptStore.getState().updateInterimSegment);
@@ -172,9 +172,7 @@ export function useSpeechRecognition() {
           segmentCounterRef.current += 1;
           const now = Date.now();
           const speakerId = speakerLabel === "User" ? "you" : "them";
-          const wordCount = transcript.split(/\s+/).filter(Boolean).length;
-          useSpeakerStore.getState().updateStats(speakerId, wordCount, 0);
-          updateInterimRef.current({
+          const finalSeg = {
             id: segId,
             text: transcript,
             speaker: speakerLabel,
@@ -182,11 +180,14 @@ export function useSpeechRecognition() {
             timestamp_ms: now,
             is_final: true,
             confidence,
-          });
+          };
+          updateInterimRef.current(finalSeg);
+          // Broadcast to overlay window — it has its own Zustand store and needs events
+          emit("transcript_final", { segment: finalSeg }).catch(() => {});
           pushTranscript(transcript, speakerLabel, now, true).catch(() => {});
         } else {
           const speakerId = speakerLabel === "User" ? "you" : "them";
-          updateInterimRef.current({
+          const interimSeg = {
             id: segId,
             text: transcript,
             speaker: speakerLabel,
@@ -194,7 +195,10 @@ export function useSpeechRecognition() {
             timestamp_ms: Date.now(),
             is_final: false,
             confidence: 0,
-          });
+          };
+          updateInterimRef.current(interimSeg);
+          // Broadcast to overlay window
+          emit("transcript_update", { segment: interimSeg }).catch(() => {});
         }
       }
     };

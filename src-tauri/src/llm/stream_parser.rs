@@ -60,6 +60,32 @@ impl SSEParser {
             .map(|s| s.to_string())
     }
 
+    /// Extract web search grounding sources from a Gemini SSE data object, if present.
+    /// Path: candidates[0].groundingMetadata.groundingChunks[].web.{uri,title}
+    pub fn extract_gemini_grounding(data: &Value) -> Vec<(String, String)> {
+        data.get("candidates")
+            .and_then(|c| c.get(0))
+            .and_then(|candidate| candidate.get("groundingMetadata"))
+            .and_then(|gm| gm.get("groundingChunks"))
+            .and_then(|chunks| chunks.as_array())
+            .map(|chunks| {
+                chunks
+                    .iter()
+                    .filter_map(|chunk| {
+                        let web = chunk.get("web")?;
+                        let uri = web.get("uri")?.as_str()?.to_string();
+                        let title = web
+                            .get("title")
+                            .and_then(|t| t.as_str())
+                            .unwrap_or(&uri)
+                            .to_string();
+                        Some((title, uri))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// Extract token text from a Gemini SSE data object.
     /// Path: candidates[0].content.parts[0].text
     pub fn extract_gemini_token(data: &Value) -> Option<String> {

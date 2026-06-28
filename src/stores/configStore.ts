@@ -150,6 +150,12 @@ interface ConfigState {
   translationTextColor: string;
   aiResponseTextColor: string;
   aiResponseFontSize: number;
+  aiResponseLineHeight: number;
+  aiResponseHPad: number;
+  aiResponseAlign: "left" | "center" | "right";
+
+  // Overlay appearance
+  overlayOpacity: number;
 
   // Post-meeting translation
   showPostMeetingTranslation: boolean;
@@ -214,6 +220,10 @@ interface ConfigState {
   setTranslationTextColor: (color: string) => void;
   setAiResponseTextColor: (color: string) => void;
   setAiResponseFontSize: (size: number) => void;
+  setAiResponseLineHeight: (v: number) => void;
+  setAiResponseHPad: (v: number) => void;
+  setAiResponseAlign: (align: "left" | "center" | "right") => void;
+  setOverlayOpacity: (opacity: number) => void;
   setShowPostMeetingTranslation: (enabled: boolean) => void;
   toggleOpenRouterFavorite: (id: string) => void;
   addOpenRouterRecentlyUsed: (id: string) => void;
@@ -265,6 +275,10 @@ export const useConfigStore = create<ConfigState>((set) => ({
   translationTextColor: "#fbbf24",
   aiResponseTextColor: "#d4d4d8",
   aiResponseFontSize: 12,
+  aiResponseLineHeight: 1.6,
+  aiResponseHPad: 0,
+  aiResponseAlign: "left" as const,
+  overlayOpacity: 0.65,
   showPostMeetingTranslation: true,
   openrouterFavorites: [],
   openrouterRecentlyUsed: [],
@@ -548,6 +562,22 @@ export const useConfigStore = create<ConfigState>((set) => ({
     set({ aiResponseFontSize: size });
     persistValue("aiResponseFontSize", size);
   },
+  setAiResponseLineHeight: (v) => {
+    set({ aiResponseLineHeight: v });
+    persistValue("aiResponseLineHeight", v);
+  },
+  setAiResponseHPad: (v) => {
+    set({ aiResponseHPad: v });
+    persistValue("aiResponseHPad", v);
+  },
+  setAiResponseAlign: (align) => {
+    set({ aiResponseAlign: align });
+    persistValue("aiResponseAlign", align);
+  },
+  setOverlayOpacity: (opacity) => {
+    set({ overlayOpacity: opacity });
+    persistValue("overlayOpacity", opacity);
+  },
   setShowPostMeetingTranslation: (enabled) => {
     set({ showPostMeetingTranslation: enabled });
     persistValue("showPostMeetingTranslation", enabled);
@@ -651,6 +681,10 @@ export const useConfigStore = create<ConfigState>((set) => ({
       const translationTextColor = await store.get<string>("translationTextColor");
       const aiResponseTextColor = await store.get<string>("aiResponseTextColor");
       const aiResponseFontSize = await store.get<number>("aiResponseFontSize");
+      const aiResponseLineHeight = await store.get<number>("aiResponseLineHeight");
+      const aiResponseHPad = await store.get<number>("aiResponseHPad");
+      const aiResponseAlign = await store.get<string>("aiResponseAlign");
+      const overlayOpacity = await store.get<number>("overlayOpacity");
       const showPostMeetingTranslation = await store.get<boolean>("showPostMeetingTranslation");
       const trayNotifications = await store.get<boolean>("trayNotifications");
       const trayAutoStart = await store.get<boolean>("trayAutoStart");
@@ -796,6 +830,11 @@ export const useConfigStore = create<ConfigState>((set) => ({
         translationTextColor: translationTextColor ?? "#fbbf24",
         aiResponseTextColor: aiResponseTextColor ?? "#d4d4d8",
         aiResponseFontSize: aiResponseFontSize ?? 12,
+        aiResponseLineHeight: aiResponseLineHeight ?? 1.6,
+        aiResponseHPad: aiResponseHPad ?? 0,
+        aiResponseAlign: (aiResponseAlign as "left" | "center" | "right") ?? "left",
+        overlayOpacity: overlayOpacity ?? 0.65,
+        sttLanguage: sttLanguage ?? "en-US",
         showPostMeetingTranslation: showPostMeetingTranslation ?? true,
         ...(trayNotifications != null && { trayNotifications }),
         ...(trayAutoStart != null && { trayAutoStart }),
@@ -856,6 +895,9 @@ export const useConfigStore = create<ConfigState>((set) => ({
       });
       store.onKeyChange<WhisperDualPassConfig>("whisperDualPass", (val) => {
         if (val != null) set({ whisperDualPass: val });
+      });
+      store.onKeyChange<number>("overlayOpacity", (val) => {
+        if (val != null) set({ overlayOpacity: val });
       });
 
       // Sync persisted STT language to Rust backend on startup.
