@@ -16,6 +16,7 @@ import { useTranslation } from "./hooks/useTranslation";
 import { useTraySync } from "./hooks/useTraySync";
 import { useUpdater } from "./hooks/useUpdater";
 import { useTranslationStore } from "./stores/translationStore";
+import { useTranscriptStore } from "./stores/transcriptStore";
 import { CallLogPanel } from "./calllog";
 import { SelectionToolbar } from "./components/SelectionToolbar";
 import { ActiveMeetingProvider } from "./components/ActiveMeetingProvider";
@@ -163,6 +164,13 @@ function App() {
       "nexq:meeting_started",
       (e) => {
         const { meeting, audioMode, aiScenario } = e.payload;
+        const transcriptStore = useTranscriptStore.getState();
+        const segmentsBeforeReset = transcriptStore.segments.length;
+        transcriptStore.resetSession();
+        const segmentsAfterReset = useTranscriptStore.getState().segments.length;
+        console.info(
+          `[meetingLifecycle] [overlay] Start meetingId=${meeting.id} transcript reset ${segmentsBeforeReset} -> ${segmentsAfterReset}`
+        );
         useMeetingStore.setState({
           activeMeeting: meeting,
           currentView: "overlay",

@@ -11,6 +11,7 @@ interface TranscriptState {
   updateInterimSegment: (segment: TranscriptSegment) => void;
   finalizeAllInterim: () => void;
   clearSegments: () => void;
+  resetSession: () => void;
   setSearchQuery: (query: string) => void;
   setAutoScroll: (auto: boolean) => void;
   reassignSpeaker: (fromId: string, toId: string) => void;
@@ -47,6 +48,12 @@ export const useTranscriptStore = create<TranscriptState>((set) => ({
     })),
 
   clearSegments: () => set({ segments: [] }),
+  resetSession: () =>
+    set({
+      segments: [],
+      searchQuery: "",
+      autoScroll: true,
+    }),
   setSearchQuery: (query) => set({ searchQuery: query }),
   setAutoScroll: (auto) => set({ autoScroll: auto }),
   reassignSpeaker: (fromId, toId) =>

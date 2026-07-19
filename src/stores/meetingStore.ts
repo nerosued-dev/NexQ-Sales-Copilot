@@ -12,6 +12,15 @@ import {
 import { useConfigStore } from "./configStore";
 import { useTranscriptStore } from "./transcriptStore";
 
+async function getCurrentWindowLabel(): Promise<string> {
+  try {
+    const { getCurrentWebviewWindow } = await import("@tauri-apps/api/webviewWindow");
+    return getCurrentWebviewWindow().label;
+  } catch {
+    return "unknown";
+  }
+}
+
 interface MeetingState {
   // View state
   currentView: AppView;
@@ -181,7 +190,25 @@ export const useMeetingStore = create<MeetingState>((set, get) => ({
         await setRecordingEnabled(config.recordingEnabled);
       } catch { /* non-critical */ }
 
-      // 3. Start audio capture — use per-party config if available, else legacy
+      // 3. Reset transcript state and activate the meeting before capture starts.
+      const windowLabel = await getCurrentWindowLabel();
+      const transcriptStore = useTranscriptStore.getState();
+      const segmentsBeforeReset = transcriptStore.segments.length;
+      transcriptStore.resetSession();
+      const segmentsAfterReset = useTranscriptStore.getState().segments.length;
+      const now = Date.now();
+      set({
+        activeMeeting: meeting,
+        isRecording: true,
+        meetingStartTime: now,
+        elapsedMs: 0,
+        lastPersistedIndex: 0,
+      });
+      console.info(
+        `[meetingLifecycle] [${windowLabel}] Start meetingId=${meeting.id} transcript reset ${segmentsBeforeReset} -> ${segmentsAfterReset}`
+      );
+
+      // 4. Start audio capture — use per-party config if available, else legacy
       try {
         if (config.meetingAudioConfig) {
           await startCapturePerParty(
@@ -208,9 +235,6 @@ export const useMeetingStore = create<MeetingState>((set, get) => ({
         console.warn("[meetingStore] Audio capture failed to start:", err);
         // Continue anyway — meeting is created, user can still use AI features
       }
-
-      // 3. Clear previous transcript segments and leftover AI state
-      useTranscriptStore.getState().clearSegments();
 
       // Clear AI response history, dev log, and call log from any prior meeting
       try {
@@ -241,16 +265,6 @@ export const useMeetingStore = create<MeetingState>((set, get) => ({
         useTopicSectionStore.getState().clearSections();
       } catch { /* non-critical */ }
 
-      // 4. Set meeting state
-      const now = Date.now();
-      set({
-        activeMeeting: meeting,
-        isRecording: true,
-        meetingStartTime: now,
-        elapsedMs: 0,
-        lastPersistedIndex: 0,
-      });
-
       // 5. Start timer
       get().startTimer();
 
@@ -274,6 +288,10 @@ export const useMeetingStore = create<MeetingState>((set, get) => ({
   endMeetingFlow: async () => {
     const state = get();
     const meeting = state.activeMeeting;
+    const windowLabel = await getCurrentWindowLabel();
+    console.info(
+      `[meetingLifecycle] [${windowLabel}] End meetingId=${meeting?.id ?? "none"} transcript segments=${useTranscriptStore.getState().segments.length}`
+    );
 
     // 1. Stop timer
     state.stopTimer();
@@ -292,6 +310,7 @@ export const useMeetingStore = create<MeetingState>((set, get) => ({
     if (mutedThem) configStore.getState().toggleMuteThem();
 
     // 3. Flush all remaining transcript segments to DB before ending
+    let transcriptFlushSucceeded = true;
     if (meeting) {
       const segments = useTranscriptStore.getState().segments;
       const lastIdx = get().lastPersistedIndex;
@@ -302,6 +321,7 @@ export const useMeetingStore = create<MeetingState>((set, get) => ({
           const { appendTranscriptSegment } = await import("../lib/ipc");
           await appendTranscriptSegment(meeting.id, JSON.stringify(seg));
         } catch (err) {
+          transcriptFlushSucceeded = false;
           console.error("[meetingStore] Failed to persist segment:", err);
           break;
         }
@@ -459,7 +479,14 @@ export const useMeetingStore = create<MeetingState>((set, get) => ({
       useTranslationStore.getState().clearTranslations();
     } catch { /* non-critical */ }
 
-    // 8. Clear active state
+    // 8. Clear transcript only after its final persistence completed successfully.
+    const segmentsBeforeReset = useTranscriptStore.getState().segments.length;
+    if (transcriptFlushSucceeded) {
+      useTranscriptStore.getState().resetSession();
+    }
+    const segmentsAfterReset = useTranscriptStore.getState().segments.length;
+
+    // Clear active state and persistence checkpoint before leaving the meeting view.
     set({
       activeMeeting: null,
       isRecording: false,
@@ -469,6 +496,9 @@ export const useMeetingStore = create<MeetingState>((set, get) => ({
       audioMode: "online",
       aiScenario: "team_meeting",
     });
+    console.info(
+      `[meetingLifecycle] [${windowLabel}] End meetingId=${meeting?.id ?? "none"} transcript reset ${segmentsBeforeReset} -> ${segmentsAfterReset} flushSucceeded=${transcriptFlushSucceeded}`
+    );
 
     // 9. Reload recent meetings
     await get().loadRecentMeetings();
