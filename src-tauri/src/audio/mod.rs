@@ -14,6 +14,25 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
+#[cfg(debug_assertions)]
+fn transcript_diag_ts_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+}
+
+macro_rules! transcript_diag {
+    ($($arg:tt)*) => {
+        #[cfg(debug_assertions)]
+        log::info!(
+            "NEXQ_TRANSCRIPT_DIAG timestampMs={} component=audio_manager {}",
+            transcript_diag_ts_ms(),
+            format_args!($($arg)*)
+        );
+    };
+}
+
 use crate::audio::recorder::SharedRecorder;
 use crate::audio::vad::VoiceActivityDetector;
 
@@ -237,20 +256,30 @@ impl AudioCaptureManager {
         }
 
         log::info!("Stopping audio capture pipeline");
+        transcript_diag!(
+            "event=producer_stop_requested isCapturing={}",
+            self.is_capturing
+        );
 
         // Signal system capture thread to stop
         self.stop_flag.store(true, Ordering::SeqCst);
 
         // Drop the mic stream (this stops cpal capture)
         self.mic_stream.take();
+        transcript_diag!("event=mic_stream_dropped");
 
         // Drop system input stream (if using input device capture for "Them")
         self.system_input_stream.take();
+        transcript_diag!("event=system_input_stream_dropped");
 
         // Wait for system capture thread to finish (with timeout)
         if let Some(thread) = self.system_thread.take() {
             // Give the thread a moment to stop, then move on
+            transcript_diag!("event=system_thread_join_started");
             let _ = thread.join();
+            transcript_diag!("event=system_thread_join_finished");
+        } else {
+            transcript_diag!("event=system_thread_join_not_required");
         }
 
         // Stop recording — capture info for post-meeting pipeline

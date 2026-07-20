@@ -28,6 +28,25 @@ use tokio::sync::mpsc;
 use crate::audio::AudioChunk;
 use crate::stt::provider::{STTProvider, STTProviderType, TranscriptResult};
 
+#[cfg(debug_assertions)]
+fn transcript_diag_ts_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+}
+
+macro_rules! transcript_diag {
+    ($($arg:tt)*) => {
+        #[cfg(debug_assertions)]
+        log::info!(
+            "NEXQ_TRANSCRIPT_DIAG timestampMs={} component=groq {}",
+            transcript_diag_ts_ms(),
+            format_args!($($arg)*)
+        );
+    };
+}
+
 /// Sample rate expected by the audio pipeline (16 kHz mono).
 const SAMPLE_RATE: u32 = 16000;
 
@@ -152,6 +171,9 @@ pub struct GroqWhisperSTT {
     party: String,
     /// Channel to send results to the utterance accumulator task.
     accumulator_tx: Option<mpsc::Sender<AccumulatorMsg>>,
+    /// Debug-only sequence source for correlating request lifecycle logs.
+    /// It is never persisted, emitted, or read by functional logic.
+    diag_request_counter: u64,
 }
 
 impl GroqWhisperSTT {
@@ -171,6 +193,7 @@ impl GroqWhisperSTT {
             app_handle: None,
             party: String::new(),
             accumulator_tx: None,
+            diag_request_counter: 0,
         }
     }
 
@@ -361,18 +384,14 @@ impl GroqWhisperSTT {
                                 let text = text.trim().to_string();
                                 if !text.is_empty() {
                                     if let Some(handle) = app_handle {
-                                        let preview = if text.len() > 80 {
-                                            format!("{}...", &text[..77])
-                                        } else {
-                                            text.clone()
-                                        };
                                         super::emit_stt_debug(
                                             handle,
                                             "info",
                                             "groq",
                                             &format!(
-                                                "Got transcript ({}ms): \"{}\"",
-                                                latency_ms, preview
+                                                "Got transcript ({}ms, {} chars)",
+                                                latency_ms,
+                                                text.chars().count()
                                             ),
                                         );
                                     }
@@ -404,21 +423,16 @@ impl GroqWhisperSTT {
                     let status = resp.status();
                     let body = resp.text().await.unwrap_or_default();
                     log::error!(
-                        "GroqWhisperSTT: API returned status {}: {}",
+                        "GroqWhisperSTT: API returned status {} ({} response bytes)",
                         status,
-                        body
+                        body.len()
                     );
                     if let Some(handle) = app_handle {
-                        let short = if body.len() > 120 {
-                            format!("{}...", &body[..117])
-                        } else {
-                            body
-                        };
                         super::emit_stt_debug(
                             handle,
                             "error",
                             "groq",
-                            &format!("API error {}: {}", status, short),
+                            &format!("API error {} ({} response bytes)", status, body.len()),
                         );
                     }
                 }
@@ -479,6 +493,7 @@ impl STTProvider for GroqWhisperSTT {
         self.result_tx = Some(result_tx.clone());
 
         let app_handle = self.app_handle.clone();
+        let accumulator_party = self.party.clone();
 
         tokio::spawn(async move {
             let mut utt_counter: u64 = 0;
@@ -497,6 +512,12 @@ impl STTProvider for GroqWhisperSTT {
                             utt_counter += 1;
                             utt_id = format!("groq_utt_{}", utt_counter);
                         }
+                        transcript_diag!(
+                            "event=accumulator_received kind=speech party={} segmentId={} utteranceCount={}",
+                            accumulator_party,
+                            utt_id,
+                            utt_counter
+                        );
 
                         // Append this batch's text to the current utterance
                         if !utt_text.is_empty() {
@@ -517,8 +538,26 @@ impl STTProvider for GroqWhisperSTT {
                                 segment_id: Some(utt_id.clone()),
                             })
                             .await;
+                        transcript_diag!(
+                            "event=accumulator_result_sent kind=partial party={} segmentId={} utteranceCount={}",
+                            accumulator_party,
+                            utt_id,
+                            utt_counter
+                        );
                     }
-                    AccumulatorMsg::Silence | AccumulatorMsg::Flush => {
+                    message => {
+                        let message_kind = match message {
+                            AccumulatorMsg::Silence => "silence",
+                            AccumulatorMsg::Flush => "flush",
+                            AccumulatorMsg::Speech { .. } => "speech",
+                        };
+                        transcript_diag!(
+                            "event=accumulator_received kind={} party={} segmentId={} utteranceCount={}",
+                            message_kind,
+                            accumulator_party,
+                            utt_id,
+                            utt_counter
+                        );
                         if !utt_text.is_empty() {
                             // Finalize the current utterance — frontend starts new line
                             let _ = result_tx
@@ -532,6 +571,13 @@ impl STTProvider for GroqWhisperSTT {
                                     segment_id: Some(utt_id.clone()),
                                 })
                                 .await;
+                            transcript_diag!(
+                                "event=accumulator_result_sent kind=final party={} segmentId={} trigger={} utteranceCount={}",
+                                accumulator_party,
+                                utt_id,
+                                message_kind,
+                                utt_counter
+                            );
                             utt_text.clear();
 
                             if let Some(ref handle) = app_handle {
@@ -546,6 +592,12 @@ impl STTProvider for GroqWhisperSTT {
                     }
                 }
             }
+            transcript_diag!(
+                "event=accumulator_channel_closed party={} segmentId={} utteranceCount={}",
+                accumulator_party,
+                utt_id,
+                utt_counter
+            );
 
             // Flush remaining text when channel closes (stream ending)
             if !utt_text.is_empty() {
@@ -557,9 +609,15 @@ impl STTProvider for GroqWhisperSTT {
                         timestamp_ms: last_ts,
                         speaker: None,
                         language: None,
-                        segment_id: Some(utt_id),
+                        segment_id: Some(utt_id.clone()),
                     })
                     .await;
+                transcript_diag!(
+                    "event=accumulator_result_sent kind=final party={} segmentId={} trigger=channel_closed utteranceCount={}",
+                    accumulator_party,
+                    utt_id,
+                    utt_counter
+                );
             }
         });
 
@@ -569,6 +627,7 @@ impl STTProvider for GroqWhisperSTT {
         self.audio_buffer.clear();
         self.segment_counter = 0;
         self.chunks_fed = 0;
+        self.diag_request_counter = 0;
 
         self.emit_debug("info", "Stream started — accumulating audio for batch send");
         Ok(())
@@ -675,10 +734,26 @@ impl STTProvider for GroqWhisperSTT {
             let api_key = self.api_key.clone();
             let acc_tx = self.accumulator_tx.as_ref().unwrap().clone();
             let app_handle = self.app_handle.clone();
+            self.diag_request_counter += 1;
+            let request_id = self.diag_request_counter;
+            let request_party = self.party.clone();
+            let audio_duration_secs = segment.len() as f32 / SAMPLE_RATE as f32;
 
             tokio::spawn(async move {
+                transcript_diag!(
+                    "event=request_started requestId={} party={} requestType=normal audioDurationSecs={:.3}",
+                    request_id,
+                    request_party,
+                    audio_duration_secs
+                );
                 let text =
                     Self::call_api(&api_key, &config, segment, app_handle.as_ref()).await;
+                transcript_diag!(
+                    "event=request_completed requestId={} party={} requestType=normal outcome={}",
+                    request_id,
+                    request_party,
+                    if text.is_some() { "result" } else { "empty_or_failed" }
+                );
 
                 match text {
                     Some(t) if !Self::is_hallucination(&t) => {
@@ -688,22 +763,37 @@ impl STTProvider for GroqWhisperSTT {
                                 timestamp_ms,
                             })
                             .await;
+                        transcript_diag!(
+                            "event=request_result_sent requestId={} party={} requestType=normal accumulatorMessage=speech",
+                            request_id,
+                            request_party
+                        );
                     }
-                    Some(t) => {
+                    Some(_t) => {
                         // Hallucination detected — treat as silence
                         if let Some(ref handle) = app_handle {
                             super::emit_stt_debug(
                                 handle,
                                 "info",
                                 "groq",
-                                &format!("Filtered hallucination: \"{}\"", t),
+                                "Filtered hallucination",
                             );
                         }
                         let _ = acc_tx.send(AccumulatorMsg::Silence).await;
+                        transcript_diag!(
+                            "event=request_result_sent requestId={} party={} requestType=normal accumulatorMessage=silence reason=hallucination",
+                            request_id,
+                            request_party
+                        );
                     }
                     None => {
                         // API error or empty result
                         let _ = acc_tx.send(AccumulatorMsg::Silence).await;
+                        transcript_diag!(
+                            "event=request_result_sent requestId={} party={} requestType=normal accumulatorMessage=silence reason=empty_or_failed",
+                            request_id,
+                            request_party
+                        );
                     }
                 }
             });
@@ -749,6 +839,15 @@ impl STTProvider for GroqWhisperSTT {
                     .map(|t| t.elapsed().as_millis() as u64)
                     .unwrap_or(0);
                 let config = self.current_config();
+                self.diag_request_counter += 1;
+                let request_id = self.diag_request_counter;
+                let audio_duration_secs = segment.len() as f32 / SAMPLE_RATE as f32;
+                transcript_diag!(
+                    "event=request_started requestId={} party={} requestType=residual audioDurationSecs={:.3}",
+                    request_id,
+                    self.party,
+                    audio_duration_secs
+                );
 
                 // Send final segment synchronously (awaited in stop_stream)
                 let text = Self::call_api(
@@ -758,6 +857,12 @@ impl STTProvider for GroqWhisperSTT {
                     self.app_handle.as_ref(),
                 )
                 .await;
+                transcript_diag!(
+                    "event=request_completed requestId={} party={} requestType=residual outcome={}",
+                    request_id,
+                    self.party,
+                    if text.is_some() { "result" } else { "empty_or_failed" }
+                );
 
                 if let Some(t) = text {
                     if !Self::is_hallucination(&t) {
@@ -768,6 +873,11 @@ impl STTProvider for GroqWhisperSTT {
                                     timestamp_ms,
                                 })
                                 .await;
+                            transcript_diag!(
+                                "event=request_result_sent requestId={} party={} requestType=residual accumulatorMessage=speech",
+                                request_id,
+                                self.party
+                            );
                         }
                     }
                 }
@@ -776,6 +886,11 @@ impl STTProvider for GroqWhisperSTT {
 
         // Flush the accumulator (finalize any accumulated utterance)
         if let Some(ref tx) = self.accumulator_tx {
+            transcript_diag!(
+                "event=accumulator_flush_sent party={} requestCount={}",
+                self.party,
+                self.diag_request_counter
+            );
             let _ = tx.send(AccumulatorMsg::Flush).await;
         }
 

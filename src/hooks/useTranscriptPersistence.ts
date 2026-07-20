@@ -2,6 +2,11 @@ import { useEffect, useRef } from "react";
 import { useMeetingStore } from "../stores/meetingStore";
 import { useTranscriptStore } from "../stores/transcriptStore";
 import { appendTranscriptSegment } from "../lib/ipc";
+import {
+  diagnosticErrorType,
+  getTranscriptCounts,
+  transcriptDiag,
+} from "../lib/transcriptDiagnostics";
 
 const FLUSH_INTERVAL_MS = 30_000; // 30 seconds
 
@@ -28,10 +33,19 @@ export function useTranscriptPersistence() {
     }
 
     const meetingId = activeMeeting.id;
+    transcriptDiag("persistence_hook_mounted", { meetingId });
 
-    async function flushSegments() {
+    async function flushSegments(reason: "timer" | "cleanup") {
       const segments = useTranscriptStore.getState().segments;
       const currentLastIndex = useMeetingStore.getState().lastPersistedIndex;
+      const counts = getTranscriptCounts(segments);
+
+      transcriptDiag("persistence_flush_started", {
+        reason,
+        meetingId,
+        currentLastIndex,
+        ...counts,
+      });
 
       // Persist only the contiguous finalized prefix after the last checkpoint.
       // If a later final arrives while an earlier interim is still open, don't
@@ -43,32 +57,94 @@ export function useTranscriptPersistence() {
 
       const newSegments = segments.slice(currentLastIndex, persistUntil);
 
-      if (newSegments.length === 0) return;
+      transcriptDiag("persistence_flush_selection", {
+        reason,
+        meetingId,
+        currentLastIndex,
+        persistUntil,
+        selected: newSegments.length,
+        ...counts,
+      });
+
+      if (newSegments.length === 0) {
+        transcriptDiag("persistence_flush_finished", {
+          reason,
+          meetingId,
+          selected: 0,
+          persisted: 0,
+        });
+        return;
+      }
 
       for (const segment of newSegments) {
+        transcriptDiag("persistence_insert_started", {
+          reason,
+          meetingId,
+          segmentId: segment.id,
+          isFinal: segment.is_final,
+        });
         try {
           await appendTranscriptSegment(meetingId, JSON.stringify(segment));
+          transcriptDiag("persistence_insert_succeeded", {
+            reason,
+            meetingId,
+            segmentId: segment.id,
+            isFinal: segment.is_final,
+          });
         } catch (err) {
+          transcriptDiag("persistence_insert_failed", {
+            reason,
+            meetingId,
+            segmentId: segment.id,
+            isFinal: segment.is_final,
+            errorType: diagnosticErrorType(err),
+          });
           console.error("[transcriptPersistence] Failed to persist segment:", err);
           // Stop trying to persist more if one fails
+          transcriptDiag("persistence_flush_failed", {
+            reason,
+            meetingId,
+            currentLastIndex,
+            persistUntil,
+            selected: newSegments.length,
+          });
           return;
         }
       }
 
       setLastPersistedIndex(persistUntil);
+      transcriptDiag("persistence_index_updated", {
+        reason,
+        meetingId,
+        previousIndex: currentLastIndex,
+        newIndex: persistUntil,
+      });
+      transcriptDiag("persistence_flush_finished", {
+        reason,
+        meetingId,
+        selected: newSegments.length,
+        persisted: newSegments.length,
+      });
     }
 
     // Set up the 30-second interval
-    intervalRef.current = setInterval(flushSegments, FLUSH_INTERVAL_MS);
+    intervalRef.current = setInterval(() => {
+      void flushSegments("timer");
+    }, FLUSH_INTERVAL_MS);
 
     return () => {
       // On cleanup, do a final flush
-      flushSegments();
+      transcriptDiag("persistence_hook_cleanup", {
+        meetingId,
+        asyncFlushAwaited: false,
+      });
+      void flushSegments("cleanup");
 
       if (intervalRef.current) {
         clearInterval(intervalRef.current);
         intervalRef.current = null;
       }
+      transcriptDiag("persistence_hook_unmounted", { meetingId });
     };
   }, [activeMeeting, setLastPersistedIndex]);
 }

@@ -27,6 +27,7 @@ import { useDemoShortcut } from "./demo/useDemoShortcut";
 import { DemoPicker } from "./demo/DemoPicker";
 import { DemoBadge } from "./demo/DemoBadge";
 import { showLauncherWindow, showOverlayWindow } from "./lib/windows";
+import { transcriptDiag } from "./lib/transcriptDiagnostics";
 
 function App() {
   const currentView = useMeetingStore((s) => s.currentView);
@@ -135,6 +136,10 @@ function App() {
     if (windowLabel !== "launcher") return;
     let unlisten: (() => void) | undefined;
     listen("nexq:meeting_ended", () => {
+      transcriptDiag("meeting_ended_received", {
+        role: "launcher",
+        meetingId: useMeetingStore.getState().activeMeeting?.id,
+      });
       useMeetingStore.setState({
         currentView: "launcher",
         activeMeeting: null,
@@ -164,8 +169,14 @@ function App() {
       "nexq:meeting_started",
       (e) => {
         const { meeting, audioMode, aiScenario } = e.payload;
+        transcriptDiag("meeting_started_received", {
+          role: "overlay",
+          meetingId: meeting.id,
+        });
         const transcriptStore = useTranscriptStore.getState();
         const segmentsBeforeReset = transcriptStore.segments.length;
+        const lastPersistedIndexBeforeReset =
+          useMeetingStore.getState().lastPersistedIndex;
         transcriptStore.resetSession();
         const segmentsAfterReset = useTranscriptStore.getState().segments.length;
         console.info(
@@ -180,6 +191,15 @@ function App() {
           meetingStartTime: Date.now(),
           elapsedMs: 0,
           lastPersistedIndex: 0,
+        });
+        transcriptDiag("meeting_started_state_reset", {
+          role: "overlay",
+          meetingId: meeting.id,
+          segmentsBeforeReset,
+          segmentsAfterReset,
+          lastPersistedIndexBeforeReset,
+          lastPersistedIndexAfterReset:
+            useMeetingStore.getState().lastPersistedIndex,
         });
         useMeetingStore.getState().startTimer();
       }

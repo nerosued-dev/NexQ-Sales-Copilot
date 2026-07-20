@@ -6,6 +6,7 @@
 // Two-window architecture: launcher window handles persistence/audio control;
 // overlay window subscribes to events for display only.
 
+import { useEffect } from "react";
 import { useMeetingStore } from "../stores/meetingStore";
 import { useMeetingTimer } from "../hooks/useMeetingTimer";
 import { useTranscriptPersistence } from "../hooks/useTranscriptPersistence";
@@ -16,6 +17,7 @@ import { useStreamBuffer } from "../hooks/useStreamBuffer";
 import { useCallLogCapture } from "../hooks/useCallLogCapture";
 import { useSTTStatus } from "../hooks/useSTTStatus";
 import { useDevLog } from "../hooks/useDevLog";
+import { transcriptDiag } from "../lib/transcriptDiagnostics";
 
 export function ActiveMeetingProvider({ isLauncherWindow = true }: { isLauncherWindow?: boolean }) {
   const activeMeeting = useMeetingStore((s) => s.activeMeeting);
@@ -30,6 +32,20 @@ export function ActiveMeetingProvider({ isLauncherWindow = true }: { isLauncherW
 
 // Overlay window: display-only hooks — populate local Zustand stores from Tauri events
 function OverlayMeetingHooks() {
+  useEffect(() => {
+    const meetingId = useMeetingStore.getState().activeMeeting?.id;
+    transcriptDiag("active_meeting_provider_mounted", {
+      role: "overlay",
+      meetingId,
+    });
+    return () => {
+      transcriptDiag("active_meeting_provider_unmounted", {
+        role: "overlay",
+        meetingId,
+      });
+    };
+  }, []);
+
   useMeetingTimer();
   useTranscript();    // transcript_final/update → local store
   useStreamBuffer();  // AI streaming events → local store
@@ -40,6 +56,20 @@ function OverlayMeetingHooks() {
 
 // Launcher window: persistence + audio control (hidden during meeting)
 function LauncherMeetingHooks() {
+  useEffect(() => {
+    const meetingId = useMeetingStore.getState().activeMeeting?.id;
+    transcriptDiag("active_meeting_provider_mounted", {
+      role: "launcher",
+      meetingId,
+    });
+    return () => {
+      transcriptDiag("active_meeting_provider_unmounted", {
+        role: "launcher",
+        meetingId,
+      });
+    };
+  }, []);
+
   useMeetingTimer();
   useTranscript();         // also subscribe here so persistence hook sees segments
   useSpeechRecognition();  // web speech API (emits cross-window events for overlay)

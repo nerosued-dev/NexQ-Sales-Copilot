@@ -6,6 +6,42 @@ use crate::db::meetings::{
 };
 use crate::state::AppState;
 
+#[cfg(debug_assertions)]
+fn transcript_diag_ts_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+}
+
+macro_rules! transcript_diag {
+    ($($arg:tt)*) => {
+        #[cfg(debug_assertions)]
+        log::info!(
+            "NEXQ_TRANSCRIPT_DIAG timestampMs={} component=meeting_commands {}",
+            transcript_diag_ts_ms(),
+            format_args!($($arg)*)
+        );
+    };
+}
+
+#[cfg(debug_assertions)]
+struct EndMeetingDiagGuard {
+    meeting_id: String,
+    succeeded: bool,
+}
+
+#[cfg(debug_assertions)]
+impl Drop for EndMeetingDiagGuard {
+    fn drop(&mut self) {
+        transcript_diag!(
+            "event=end_meeting_finished meetingId={} succeeded={}",
+            self.meeting_id,
+            self.succeeded
+        );
+    }
+}
+
 #[command]
 pub async fn save_meeting_ai_interactions(
     meeting_id: String,
@@ -93,6 +129,13 @@ pub async fn end_meeting(
     state: State<'_, AppState>,
     app: AppHandle,
 ) -> Result<(), String> {
+    transcript_diag!("event=end_meeting_entered meetingId={}", meeting_id);
+    #[cfg(debug_assertions)]
+    let mut diag_guard = EndMeetingDiagGuard {
+        meeting_id: meeting_id.clone(),
+        succeeded: false,
+    };
+
     let db_arc = state
         .database
         .as_ref()
@@ -184,6 +227,10 @@ pub async fn end_meeting(
     }
 
     let _ = (end_time, duration_seconds); // suppress unused warnings
+    #[cfg(debug_assertions)]
+    {
+        diag_guard.succeeded = true;
+    }
     Ok(())
 }
 
@@ -365,9 +412,23 @@ pub async fn append_transcript_segment(
         confidence: partial["confidence"].as_f64().unwrap_or(0.0),
         created_at: chrono::Utc::now().to_rfc3339(),
     };
+    transcript_diag!(
+        "event=append_transcript_entered meetingId={} segmentId={} isFinal={}",
+        meeting_id,
+        full_segment.id,
+        full_segment.is_final
+    );
 
-    meetings::append_transcript_segment(db.connection(), &meeting_id, &full_segment)
-        .map_err(|e| format!("Failed to append transcript segment: {}", e))
+    let result = meetings::append_transcript_segment(db.connection(), &meeting_id, &full_segment)
+        .map_err(|e| format!("Failed to append transcript segment: {}", e));
+    transcript_diag!(
+        "event=append_transcript_finished meetingId={} segmentId={} isFinal={} succeeded={}",
+        meeting_id,
+        full_segment.id,
+        full_segment.is_final,
+        result.is_ok()
+    );
+    result
 }
 
 // ── In-person meeting mode commands ─────────────────────────────────────────

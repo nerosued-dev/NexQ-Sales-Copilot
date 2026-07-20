@@ -9,6 +9,10 @@ import { useTranscriptStore } from "../stores/transcriptStore";
 import { useSpeakerStore } from "../stores/speakerStore";
 import { useConfigStore } from "../stores/configStore";
 import type { TranscriptSegment, TranscriptUpdateEvent } from "../lib/types";
+import {
+  getTranscriptCounts,
+  transcriptDiag,
+} from "../lib/transcriptDiagnostics";
 
 // Cache reference to avoid repeated imports
 let _meetingStoreRef: typeof import("../stores/meetingStore") | null = null;
@@ -67,7 +71,7 @@ function processSpeaker(segment: TranscriptSegment): TranscriptSegment | null {
   // Debug: log speaker assignment for final segments
   if (segment.is_final) {
     devLog(
-      `[speaker] "${segment.text.slice(0, 40)}" | raw_speaker=${segment.speaker ?? "?"} raw_speaker_id=${segment.speaker_id ?? "none"} mode=${isInPerson ? "in_person" : "online"} → speakerId=${speakerId}`
+      `[speaker] segmentId=${segment.id} raw_speaker=${segment.speaker ?? "?"} raw_speaker_id=${segment.speaker_id ?? "none"} mode=${isInPerson ? "in_person" : "online"} → speakerId=${speakerId}`
     );
   }
 
@@ -128,6 +132,16 @@ export function useTranscript() {
           const enriched = processSpeaker(event.segment);
           if (!enriched) return; // Discarded (e.g., "User" in in-person mode)
           updateRef.current(enriched);
+          const counts = getTranscriptCounts(
+            useTranscriptStore.getState().segments
+          );
+          transcriptDiag("transcript_event_received", {
+            eventType: "partial",
+            segmentId: enriched.id,
+            speaker: enriched.speaker,
+            isFinal: enriched.is_final,
+            ...counts,
+          });
         }
       );
 
@@ -140,6 +154,16 @@ export function useTranscript() {
           // Use updateInterimSegment so it replaces the interim with same id,
           // or appends if no interim existed (e.g., very short utterance)
           updateRef.current(enriched);
+          const counts = getTranscriptCounts(
+            useTranscriptStore.getState().segments
+          );
+          transcriptDiag("transcript_event_received", {
+            eventType: "final",
+            segmentId: enriched.id,
+            speaker: enriched.speaker,
+            isFinal: enriched.is_final,
+            ...counts,
+          });
         }
       );
 

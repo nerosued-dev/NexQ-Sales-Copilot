@@ -11,6 +11,11 @@ import {
 } from "../lib/ipc";
 import { useConfigStore } from "./configStore";
 import { useTranscriptStore } from "./transcriptStore";
+import {
+  diagnosticErrorType,
+  getTranscriptCounts,
+  transcriptDiag,
+} from "../lib/transcriptDiagnostics";
 
 async function getCurrentWindowLabel(): Promise<string> {
   try {
@@ -194,6 +199,7 @@ export const useMeetingStore = create<MeetingState>((set, get) => ({
       const windowLabel = await getCurrentWindowLabel();
       const transcriptStore = useTranscriptStore.getState();
       const segmentsBeforeReset = transcriptStore.segments.length;
+      const lastPersistedIndexBeforeReset = get().lastPersistedIndex;
       transcriptStore.resetSession();
       const segmentsAfterReset = useTranscriptStore.getState().segments.length;
       const now = Date.now();
@@ -203,6 +209,14 @@ export const useMeetingStore = create<MeetingState>((set, get) => ({
         meetingStartTime: now,
         elapsedMs: 0,
         lastPersistedIndex: 0,
+      });
+      transcriptDiag("meeting_started_state_reset", {
+        role: "launcher",
+        meetingId: meeting.id,
+        segmentsBeforeReset,
+        segmentsAfterReset,
+        lastPersistedIndexBeforeReset,
+        lastPersistedIndexAfterReset: get().lastPersistedIndex,
       });
       console.info(
         `[meetingLifecycle] [${windowLabel}] Start meetingId=${meeting.id} transcript reset ${segmentsBeforeReset} -> ${segmentsAfterReset}`
@@ -273,6 +287,10 @@ export const useMeetingStore = create<MeetingState>((set, get) => ({
 
       // 7. Notify overlay Tauri window to initialize meeting UI
       import("@tauri-apps/api/event").then(({ emit }) => {
+        transcriptDiag("meeting_started_emit", {
+          role: "launcher",
+          meetingId: meeting.id,
+        });
         emit("nexq:meeting_started", {
           meeting,
           audioMode: resolvedMode,
@@ -289,17 +307,33 @@ export const useMeetingStore = create<MeetingState>((set, get) => ({
     const state = get();
     const meeting = state.activeMeeting;
     const windowLabel = await getCurrentWindowLabel();
+    transcriptDiag("end_flow_entered", {
+      meetingId: meeting?.id,
+      isRecording: state.isRecording,
+    });
     console.info(
       `[meetingLifecycle] [${windowLabel}] End meetingId=${meeting?.id ?? "none"} transcript segments=${useTranscriptStore.getState().segments.length}`
     );
 
     // 1. Stop timer
+    transcriptDiag("end_stop_timer_before", { meetingId: meeting?.id });
     state.stopTimer();
+    transcriptDiag("end_stop_timer_after", { meetingId: meeting?.id });
 
     // 2. Stop audio capture
+    transcriptDiag("end_stop_capture_before", { meetingId: meeting?.id });
     try {
       await stopCapture();
+      transcriptDiag("end_stop_capture_returned", {
+        meetingId: meeting?.id,
+        succeeded: true,
+      });
     } catch (err) {
+      transcriptDiag("end_stop_capture_returned", {
+        meetingId: meeting?.id,
+        succeeded: false,
+        errorType: diagnosticErrorType(err),
+      });
       console.warn("[meetingStore] Audio capture failed to stop:", err);
     }
 
@@ -315,20 +349,53 @@ export const useMeetingStore = create<MeetingState>((set, get) => ({
       const segments = useTranscriptStore.getState().segments;
       const lastIdx = get().lastPersistedIndex;
       const unpersisted = segments.slice(lastIdx).filter((s) => s.is_final);
+      const counts = getTranscriptCounts(segments);
+      transcriptDiag("end_snapshot_read", {
+        meetingId: meeting.id,
+        lastPersistedIndex: lastIdx,
+        selected: unpersisted.length,
+        ...counts,
+      });
+      transcriptDiag("end_flush_started", {
+        meetingId: meeting.id,
+        selected: unpersisted.length,
+      });
 
       for (const seg of unpersisted) {
+        transcriptDiag("end_insert_started", {
+          meetingId: meeting.id,
+          segmentId: seg.id,
+          isFinal: seg.is_final,
+        });
         try {
           const { appendTranscriptSegment } = await import("../lib/ipc");
           await appendTranscriptSegment(meeting.id, JSON.stringify(seg));
+          transcriptDiag("end_insert_succeeded", {
+            meetingId: meeting.id,
+            segmentId: seg.id,
+            isFinal: seg.is_final,
+          });
         } catch (err) {
           transcriptFlushSucceeded = false;
+          transcriptDiag("end_insert_failed", {
+            meetingId: meeting.id,
+            segmentId: seg.id,
+            isFinal: seg.is_final,
+            errorType: diagnosticErrorType(err),
+          });
           console.error("[meetingStore] Failed to persist segment:", err);
           break;
         }
       }
+      transcriptDiag("end_flush_finished", {
+        meetingId: meeting.id,
+        selected: unpersisted.length,
+        succeeded: transcriptFlushSucceeded,
+      });
     }
 
     // 4. Persist AI call log entries as AI interactions before ending
+    transcriptDiag("end_aux_metadata_started", { meetingId: meeting?.id });
     if (meeting) {
       try {
         const { useCallLogStore } = await import("./callLogStore");
@@ -361,9 +428,19 @@ export const useMeetingStore = create<MeetingState>((set, get) => ({
 
     // 5. End meeting record in DB
     if (meeting) {
+      transcriptDiag("end_meeting_ipc_before", { meetingId: meeting.id });
       try {
         await ipcEndMeeting(meeting.id);
+        transcriptDiag("end_meeting_ipc_returned", {
+          meetingId: meeting.id,
+          succeeded: true,
+        });
       } catch (err) {
+        transcriptDiag("end_meeting_ipc_returned", {
+          meetingId: meeting.id,
+          succeeded: false,
+          errorType: diagnosticErrorType(err),
+        });
         console.error("[meetingStore] Failed to end meeting:", err);
       }
     }
@@ -478,15 +555,28 @@ export const useMeetingStore = create<MeetingState>((set, get) => ({
       const { useTranslationStore } = await import("./translationStore");
       useTranslationStore.getState().clearTranslations();
     } catch { /* non-critical */ }
+    transcriptDiag("end_aux_metadata_finished", { meetingId: meeting?.id });
 
     // 8. Clear transcript only after its final persistence completed successfully.
     const segmentsBeforeReset = useTranscriptStore.getState().segments.length;
+    transcriptDiag("end_transcript_reset_before", {
+      meetingId: meeting?.id,
+      segmentsBeforeReset,
+      flushSucceeded: transcriptFlushSucceeded,
+    });
     if (transcriptFlushSucceeded) {
       useTranscriptStore.getState().resetSession();
     }
     const segmentsAfterReset = useTranscriptStore.getState().segments.length;
+    transcriptDiag("end_transcript_reset_after", {
+      meetingId: meeting?.id,
+      segmentsBeforeReset,
+      segmentsAfterReset,
+      resetPerformed: transcriptFlushSucceeded,
+    });
 
     // Clear active state and persistence checkpoint before leaving the meeting view.
+    const lastPersistedIndexBeforeReset = get().lastPersistedIndex;
     set({
       activeMeeting: null,
       isRecording: false,
@@ -496,20 +586,42 @@ export const useMeetingStore = create<MeetingState>((set, get) => ({
       audioMode: "online",
       aiScenario: "team_meeting",
     });
+    transcriptDiag("end_persistence_index_reset", {
+      meetingId: meeting?.id,
+      previousIndex: lastPersistedIndexBeforeReset,
+      newIndex: get().lastPersistedIndex,
+    });
     console.info(
       `[meetingLifecycle] [${windowLabel}] End meetingId=${meeting?.id ?? "none"} transcript reset ${segmentsBeforeReset} -> ${segmentsAfterReset} flushSucceeded=${transcriptFlushSucceeded}`
     );
 
     // 9. Reload recent meetings
+    transcriptDiag("end_history_reload_before", { meetingId: meeting?.id });
     await get().loadRecentMeetings();
+    transcriptDiag("end_history_reload_after", { meetingId: meeting?.id });
 
     // 10. Switch to launcher
     set({ currentView: "launcher", previousView: null });
 
     // Notify overlay Tauri window that meeting ended
     import("@tauri-apps/api/event").then(({ emit }) => {
-      emit("nexq:meeting_ended", {}).catch(() => {});
+      transcriptDiag("meeting_ended_emit", { meetingId: meeting?.id });
+      emit("nexq:meeting_ended", {})
+        .then(() => {
+          transcriptDiag("meeting_ended_emit_finished", {
+            meetingId: meeting?.id,
+            succeeded: true,
+          });
+        })
+        .catch((err: unknown) => {
+          transcriptDiag("meeting_ended_emit_finished", {
+            meetingId: meeting?.id,
+            succeeded: false,
+            errorType: diagnosticErrorType(err),
+          });
+        });
     });
+    transcriptDiag("end_flow_exited", { meetingId: meeting?.id });
   },
 
   loadRecentMeetings: async () => {

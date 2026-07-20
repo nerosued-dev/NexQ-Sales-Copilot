@@ -11,6 +11,25 @@ use crate::audio::{AudioCaptureManager, AudioLevel, AudioSource};
 use crate::stt::provider::STTProvider;
 use crate::state::AppState;
 
+#[cfg(debug_assertions)]
+fn transcript_diag_ts_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+}
+
+macro_rules! transcript_diag {
+    ($($arg:tt)*) => {
+        #[cfg(debug_assertions)]
+        log::info!(
+            "NEXQ_TRANSCRIPT_DIAG timestampMs={} component=audio_commands {}",
+            transcript_diag_ts_ms(),
+            format_args!($($arg)*)
+        );
+    };
+}
+
 /// List all available audio input and output devices.
 #[command]
 pub async fn list_audio_devices() -> Result<String, String> {
@@ -174,6 +193,12 @@ pub async fn start_capture(
                     } else {
                         "transcript_update"
                     };
+                    transcript_diag!(
+                        "event=transcript_event_emitting pipeline=legacy party=Them eventType={} segmentId={} isFinal={}",
+                        event_name,
+                        output.id,
+                        output.is_final
+                    );
                     let payload = serde_json::json!({
                         "segment": {
                             "id": output.id,
@@ -218,11 +243,18 @@ pub async fn start_capture(
         let mut vad = VoiceActivityDetector::new();
         let mut mic_emit_counter: u32 = 0;
         let mut system_emit_counter: u32 = 0;
+        let mut mic_chunk_count: u64 = 0;
+        let mut system_chunk_count: u64 = 0;
         // Mix buffers for proper two-source recording
         let mut mix_mic: Vec<i16> = Vec::new();
         let mut mix_sys: Vec<i16> = Vec::new();
+        transcript_diag!("event=audio_processing_task_started pipeline=legacy");
 
         while let Some(mut chunk) = rx.recv().await {
+            match chunk.source {
+                AudioSource::Mic | AudioSource::Room => mic_chunk_count += 1,
+                AudioSource::System => system_chunk_count += 1,
+            }
             let vad_result = vad.process_chunk(&chunk.pcm_data);
             chunk.is_speech = vad_result.is_speech;
 
@@ -284,7 +316,19 @@ pub async fn start_capture(
             }
         }
 
+        transcript_diag!(
+            "event=audio_input_channel_closed pipeline=legacy youChunks={} themChunks={}",
+            mic_chunk_count,
+            system_chunk_count
+        );
+        transcript_diag!(
+            "event=audio_processing_loop_finished pipeline=legacy youChunks={} themChunks={}",
+            mic_chunk_count,
+            system_chunk_count
+        );
+
         // Flush remaining mix buffers on loop exit
+        transcript_diag!("event=audio_final_drain_started pipeline=legacy");
         if let Some(ref rec) = recorder {
             let mix_len = mix_mic.len().min(mix_sys.len());
             if mix_len > 0 {
@@ -302,8 +346,13 @@ pub async fn start_capture(
 
         // Clean shutdown
         if let Some(ref mut provider) = system_stt_provider {
+            transcript_diag!("event=stop_stream_entered party=Them pipeline=legacy");
             let _ = provider.stop_stream().await;
+            transcript_diag!("event=stop_stream_returned party=Them pipeline=legacy");
+        } else {
+            transcript_diag!("event=stop_stream_skipped party=Them pipeline=legacy");
         }
+        transcript_diag!("event=audio_processing_task_finished pipeline=legacy");
         log::info!("Audio processing task exiting");
     });
 
@@ -315,6 +364,16 @@ pub async fn start_capture(
 #[command]
 pub async fn stop_capture(app: AppHandle) -> Result<(), String> {
     let state = app.state::<AppState>();
+    let capture_active = state
+        .audio
+        .lock()
+        .ok()
+        .and_then(|guard| guard.as_ref().map(|manager| manager.is_capturing()))
+        .unwrap_or(false);
+    transcript_diag!(
+        "event=stop_capture_entered captureActive={}",
+        capture_active
+    );
 
     // Restore original default capture device if IPolicyConfig override was active
     restore_default_device_if_overridden(&state, &app);
@@ -327,7 +386,15 @@ pub async fn stop_capture(app: AppHandle) -> Result<(), String> {
 
         match guard.as_mut() {
             Some(mgr) => {
+                transcript_diag!(
+                    "event=stop_capture_manager_call_before captureActive={}",
+                    mgr.is_capturing()
+                );
                 let info = mgr.stop_capture();
+                transcript_diag!(
+                    "event=stop_capture_manager_call_after captureActive={}",
+                    mgr.is_capturing()
+                );
                 log::info!("Audio capture stopped via command");
                 info
             }
@@ -350,6 +417,7 @@ pub async fn stop_capture(app: AppHandle) -> Result<(), String> {
         log::info!("Recording info stored for post-meeting pipeline");
     }
 
+    transcript_diag!("event=stop_capture_returning");
     Ok(())
 }
 
@@ -1051,6 +1119,12 @@ pub async fn start_capture_per_party(
                             "transcript_update"
                         };
                         let seg_id = format!("you_{}_{}", prefix, output.id);
+                        transcript_diag!(
+                            "event=transcript_event_emitting pipeline=per_party party=You eventType={} segmentId={} isFinal={}",
+                            event_name,
+                            seg_id,
+                            output.is_final
+                        );
                         let payload = serde_json::json!({
                             "segment": {
                                 "id": seg_id,
@@ -1068,6 +1142,10 @@ pub async fn start_capture_per_party(
                 // Flush remaining accumulated segment on meeting end
                 if let Some(output) = accumulator.flush() {
                     let seg_id = format!("you_{}_{}", prefix, output.id);
+                    transcript_diag!(
+                        "event=transcript_event_emitting pipeline=per_party party=You eventType=transcript_final segmentId={} isFinal=true trigger=channel_closed",
+                        seg_id
+                    );
                     let payload = serde_json::json!({
                         "segment": {
                             "id": seg_id,
@@ -1101,6 +1179,12 @@ pub async fn start_capture_per_party(
                     } else {
                         "transcript_update"
                     };
+                    transcript_diag!(
+                        "event=transcript_event_emitting pipeline=per_party party=You eventType={} segmentId={} isFinal={} path=direct",
+                        event_name,
+                        seg_id,
+                        result.is_final
+                    );
                     let payload = serde_json::json!({
                         "segment": {
                             "id": seg_id,
@@ -1145,6 +1229,12 @@ pub async fn start_capture_per_party(
                     };
                     // Namespace IDs to avoid collision with "You" accumulator
                     let seg_id = format!("them_{}_{}", prefix, output.id);
+                    transcript_diag!(
+                        "event=transcript_event_emitting pipeline=per_party party=Them eventType={} segmentId={} isFinal={}",
+                        event_name,
+                        seg_id,
+                        output.is_final
+                    );
                     // Extract diarized speaker_id from accumulator output
                     let speaker_id_val = if output.speaker.starts_with("speaker_") {
                         Some(output.speaker.clone())
@@ -1184,6 +1274,10 @@ pub async fn start_capture_per_party(
             // Flush remaining accumulated segment on meeting end
             if let Some(output) = accumulator.flush() {
                 let seg_id = format!("them_{}_{}", prefix, output.id);
+                transcript_diag!(
+                    "event=transcript_event_emitting pipeline=per_party party=Them eventType=transcript_final segmentId={} isFinal=true trigger=channel_closed",
+                    seg_id
+                );
                 let speaker_id_val = if output.speaker.starts_with("speaker_") {
                     Some(output.speaker.clone())
                 } else {
@@ -1251,6 +1345,7 @@ pub async fn start_capture_per_party(
         // Track feed_audio errors per provider (emit once, not every chunk)
         let mut you_feed_error_emitted = false;
         let mut them_feed_error_emitted = false;
+        transcript_diag!("event=audio_processing_task_started pipeline=per_party");
 
         while let Some(mut chunk) = rx.recv().await {
             // Apply VAD from the correct per-source instance
@@ -1392,7 +1487,19 @@ pub async fn start_capture_per_party(
             }
         }
 
+        transcript_diag!(
+            "event=audio_input_channel_closed pipeline=per_party youChunks={} themChunks={}",
+            mic_chunk_count,
+            system_chunk_count
+        );
+        transcript_diag!(
+            "event=audio_processing_loop_finished pipeline=per_party youChunks={} themChunks={}",
+            mic_chunk_count,
+            system_chunk_count
+        );
+
         // Flush remaining mix buffers
+        transcript_diag!("event=audio_final_drain_started pipeline=per_party");
         if let Some(ref rec) = recorder {
             let mix_len = mix_mic.len().min(mix_sys.len());
             if mix_len > 0 {
@@ -1410,10 +1517,18 @@ pub async fn start_capture_per_party(
 
         // Clean shutdown
         if let Some(ref mut provider) = you_stt_provider {
+            transcript_diag!("event=stop_stream_entered party=You");
             let _ = provider.stop_stream().await;
+            transcript_diag!("event=stop_stream_returned party=You");
+        } else {
+            transcript_diag!("event=stop_stream_skipped party=You");
         }
         if let Some(ref mut provider) = them_stt_provider {
+            transcript_diag!("event=stop_stream_entered party=Them");
             let _ = provider.stop_stream().await;
+            transcript_diag!("event=stop_stream_returned party=Them");
+        } else {
+            transcript_diag!("event=stop_stream_skipped party=Them");
         }
 
         // Restore IPolicyConfig override if active (crash recovery for async task exit)
@@ -1427,6 +1542,7 @@ pub async fn start_capture_per_party(
             }
         }
 
+        transcript_diag!("event=audio_processing_task_finished pipeline=per_party");
         log::info!("Per-party audio processing task exiting");
     });
 

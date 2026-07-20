@@ -13,6 +13,11 @@ import { useBookmarkSuggestions } from "../../hooks/useBookmarkSuggestions";
 import { useAudioKeyboardShortcuts } from "../../hooks/useAudioKeyboardShortcuts";
 import { exportMeetingAsMarkdown } from "../../lib/export";
 import { mergeConsecutiveSegments } from "../../lib/mergeSegments";
+import {
+  diagnosticErrorType,
+  getTranscriptCounts,
+  transcriptDiag,
+} from "../../lib/transcriptDiagnostics";
 import { useDemoStore } from "../../demo/demoStore";
 import { useTranscriptStore } from "../../stores/transcriptStore";
 import { useBookmarkStore } from "../../stores/bookmarkStore";
@@ -101,7 +106,22 @@ export function MeetingDetails({ meetingId, onBack }: MeetingDetailsProps) {
     try {
       const data = await getMeeting(meetingId);
       setMeeting(data);
+      const counts = getTranscriptCounts(data.transcript);
+      const wordCount = data.transcript.reduce(
+        (total, segment) =>
+          total + segment.text.split(/\s+/).filter(Boolean).length,
+        0
+      );
+      transcriptDiag("history_meeting_loaded", {
+        meetingId,
+        wordCount,
+        ...counts,
+      });
     } catch (err) {
+      transcriptDiag("history_meeting_load_failed", {
+        meetingId,
+        errorType: diagnosticErrorType(err),
+      });
       setError(err instanceof Error ? err.message : "Failed to load meeting");
     } finally {
       setLoading(false);
