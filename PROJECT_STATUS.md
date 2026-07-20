@@ -65,6 +65,32 @@ Foi confirmado um problema distinto da limpeza dos stores:
 
 Não há correção implementada para esse bug neste momento.
 
+## Diagnóstico confirmado: encerramento e persistência do transcript
+
+A instrumentação temporária e a inspeção do fluxo confirmaram que:
+
+- `stop_capture` encerra os produtores de áudio, mas retorna ao frontend antes da conclusão do task assíncrono que drena os chunks e encerra os providers STT;
+- por isso, um segmento final pode ser emitido depois do snapshot usado pelo flush final, depois de `end_meeting` e depois do reset dos stores;
+- o checkpoint periódico de 30 segundos é executado, mas não persiste segmentos enquanto o primeiro item ainda não persistido permanece parcial, pois a seleção exige um prefixo contíguo de segmentos finais;
+- reuniões curtas podem terminar antes do primeiro checkpoint e dependem integralmente do flush de encerramento;
+- não há correção implementada para essa corrida neste momento.
+
+## Diagnóstico confirmado: detecção de voz e ruído
+
+- O VAD atual é baseado em RMS, usa threshold fixo de `300` sobre energia suavizada e preenche `AudioChunk.is_speech`.
+- O resultado desse VAD não controla o envio ao provider Groq: todos os chunks não mutados continuam sendo encaminhados a `feed_audio`.
+- O provider Groq aplica outro threshold fixo: lotes com RMS menor que `100` são tratados como silêncio; lotes com RMS maior ou igual a `100` podem ser enviados à API.
+- Qualquer resposta textual não vazia, fora da pequena lista de frases exatas reconhecidas como alucinação, é convertida em `Speech`.
+- Não existe cancelamento de eco acústico (AEC) no pipeline atual.
+- A barra visual usa `RMS / 3000`, suavização EMA e escala logarítmica. Ela amplifica níveis baixos e não representa diretamente o gate RMS usado pelo provider Groq.
+- Não há correção implementada para detecção de voz, ruído, alucinações ou vazamento acústico neste momento.
+
+## Instrumentação temporária de diagnóstico
+
+Os logs `NEXQ_TRANSCRIPT_DIAG` registram somente metadados técnicos, como timestamps, janela, IDs técnicos, contagens, RMS, duração de lote e resultado das etapas. Os logs frontend ficam restritos ao modo de desenvolvimento e os logs Rust a builds de debug.
+
+A instrumentação não altera a ordem funcional do encerramento, não adiciona espera por tasks ou requisições, não muda thresholds, seleção de segmentos, persistência, schemas ou migrations. Texto de transcript, áudio, tokens, chaves e corpos de requisição não são registrados.
+
 ## Próximo passo
 
 Auditar o fluxo de encerramento e a persistência de reuniões curtas antes de implementar qualquer correção. A auditoria deve acompanhar, no mínimo, a ordem entre parada da captura, conclusão das transcrições pendentes, chegada dos eventos ao frontend, flush dos segmentos finais, encerramento do registro da reunião e limpeza dos stores.
