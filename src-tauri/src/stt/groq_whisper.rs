@@ -27,6 +27,9 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use crate::audio::AudioChunk;
+use crate::stt::groq_response::{
+    normalize_response, parse_groq_response, NormalizedGroqTranscription,
+};
 use crate::stt::provider::{STTProvider, STTProviderType, TranscriptResult};
 
 #[cfg(debug_assertions)]
@@ -109,18 +112,12 @@ impl Default for GroqConfig {
             model: "whisper-large-v3-turbo".to_string(),
             language: "en".to_string(),
             temperature: 0.0,
-            response_format: "json".to_string(),
-            timestamp_granularities: vec![],
+            response_format: "verbose_json".to_string(),
+            timestamp_granularities: vec!["segment".to_string()],
             prompt: String::new(),
             segment_duration_secs: 5.0,
         }
     }
-}
-
-/// Groq Whisper transcription API response (OpenAI-compatible).
-#[derive(Debug, Deserialize)]
-struct GroqWhisperResponse {
-    text: Option<String>,
 }
 
 // ── Internal message types ──
@@ -323,7 +320,7 @@ impl GroqWhisperSTT {
         config: &GroqConfig,
         samples: Vec<i16>,
         app_handle: Option<&AppHandle>,
-    ) -> Result<Option<String>, String> {
+    ) -> Result<NormalizedGroqTranscription, String> {
         let duration_secs = samples.len() as f32 / SAMPLE_RATE as f32;
         let wav_data = Self::encode_wav(&samples);
         let wav_size_kb = wav_data.len() / 1024;
@@ -351,7 +348,7 @@ impl GroqWhisperSTT {
 
         let mut form = reqwest::multipart::Form::new()
             .text("model", config.model.clone())
-            .text("response_format", config.response_format.clone())
+            .text("response_format", "verbose_json")
             .text("temperature", config.temperature.to_string())
             .part("file", file_part);
 
@@ -367,12 +364,9 @@ impl GroqWhisperSTT {
             form = form.text("prompt", config.prompt.clone());
         }
 
-        // Add timestamp granularities for verbose_json format
-        if config.response_format == "verbose_json" {
-            for gran in &config.timestamp_granularities {
-                form = form.text("timestamp_granularities[]", gran.clone());
-            }
-        }
+        // Segment granularity exposes Groq's quality metadata without the extra
+        // latency of word-level timestamps.
+        form = form.text("timestamp_granularities[]", "segment");
 
         let send_start = Instant::now();
         let response = client
@@ -387,48 +381,23 @@ impl GroqWhisperSTT {
         match response {
             Ok(resp) => {
                 if resp.status().is_success() {
-                    match resp.json::<GroqWhisperResponse>().await {
-                        Ok(groq_resp) => {
-                            if let Some(text) = groq_resp.text {
-                                let text = text.trim().to_string();
-                                if !text.is_empty() {
-                                    if let Some(handle) = app_handle {
-                                        super::emit_stt_debug(
-                                            handle,
-                                            "info",
-                                            "groq",
-                                            &format!(
-                                                "Got transcript ({}ms, {} chars)",
-                                                latency_ms,
-                                                text.chars().count()
-                                            ),
-                                        );
-                                    }
-                                    return Ok(Some(text));
-                                }
-                            }
-                            if let Some(handle) = app_handle {
-                                super::emit_stt_debug(
-                                    handle,
-                                    "info",
-                                    "groq",
-                                    &format!("Empty transcript (silence) — {}ms", latency_ms),
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            log::error!("GroqWhisperSTT: Failed to parse response: {}", e);
-                            if let Some(handle) = app_handle {
-                                super::emit_stt_debug(
-                                    handle,
-                                    "error",
-                                    "groq",
-                                    &format!("Failed to parse API response: {}", e),
-                                );
-                            }
-                            return Err("Groq returned an invalid transcription response".to_string());
-                        }
+                    let body = resp.bytes().await.map_err(|_| {
+                        "Groq transcription response could not be read".to_string()
+                    })?;
+                    let parsed = parse_groq_response(&body).map_err(str::to_string)?;
+                    let normalized = normalize_response(parsed);
+                    if let Some(handle) = app_handle {
+                        super::emit_stt_debug(
+                            handle,
+                            "info",
+                            "groq",
+                            &format!(
+                                "Got verbose transcript metadata ({}ms, {} segments)",
+                                latency_ms, normalized.segment_count
+                            ),
+                        );
                     }
+                    return Ok(normalized);
                 } else {
                     let status = resp.status();
                     let body = resp.text().await.unwrap_or_default();
@@ -461,8 +430,6 @@ impl GroqWhisperSTT {
                 return Err("Groq transcription request failed".to_string());
             }
         }
-
-        Ok(None)
     }
 }
 
@@ -765,14 +732,16 @@ impl STTProvider for GroqWhisperSTT {
                     "event=request_completed requestId={} party={} requestType=normal outcome={}",
                     request_id,
                     request_party,
-                    if matches!(text, Ok(Some(_))) { "result" } else { "empty_or_failed" }
+                    if matches!(text, Ok(_)) { "result" } else { "failed" }
                 );
 
                 match text {
-                    Ok(Some(t)) if !Self::is_hallucination(&t) => {
+                    Ok(transcription)
+                        if !transcription.text.is_empty()
+                            && !Self::is_hallucination(&transcription.text) => {
                         let _ = acc_tx
                             .send(AccumulatorMsg::Speech {
-                                text: t,
+                                text: transcription.text,
                                 timestamp_ms,
                             })
                             .await;
@@ -782,7 +751,7 @@ impl STTProvider for GroqWhisperSTT {
                             request_party
                         );
                     }
-                    Ok(Some(_t)) => {
+                    Ok(_) => {
                         // Hallucination detected — treat as silence
                         if let Some(ref handle) = app_handle {
                             super::emit_stt_debug(
@@ -795,15 +764,6 @@ impl STTProvider for GroqWhisperSTT {
                         let _ = acc_tx.send(AccumulatorMsg::Silence).await;
                         transcript_diag!(
                             "event=request_result_sent requestId={} party={} requestType=normal accumulatorMessage=silence reason=hallucination",
-                            request_id,
-                            request_party
-                        );
-                    }
-                    Ok(None) => {
-                        // API error or empty result
-                        let _ = acc_tx.send(AccumulatorMsg::Silence).await;
-                        transcript_diag!(
-                            "event=request_result_sent requestId={} party={} requestType=normal accumulatorMessage=silence reason=empty_or_failed",
                             request_id,
                             request_party
                         );
@@ -892,15 +852,17 @@ impl STTProvider for GroqWhisperSTT {
                     "event=request_completed requestId={} party={} requestType=residual outcome={}",
                     request_id,
                     self.party,
-                    if matches!(text, Ok(Some(_))) { "result" } else { "empty_or_failed" }
+                    if matches!(text, Ok(_)) { "result" } else { "failed" }
                 );
 
                 match text {
-                    Ok(Some(t)) if !Self::is_hallucination(&t) => {
+                    Ok(transcription)
+                        if !transcription.text.is_empty()
+                            && !Self::is_hallucination(&transcription.text) => {
                         if let Some(ref tx) = self.accumulator_tx {
                             let _ = tx
                                 .send(AccumulatorMsg::Speech {
-                                    text: t,
+                                    text: transcription.text,
                                     timestamp_ms,
                                 })
                                 .await;
