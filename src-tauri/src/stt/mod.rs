@@ -8,6 +8,7 @@ pub mod word_diff;
 // Sub-PRD 9: Additional providers
 pub mod azure_speech;
 pub mod groq_whisper;
+mod groq_response;
 pub mod whisper_api;
 // STT Engine Overhaul: New streaming providers
 pub mod sherpa_sidecar;
