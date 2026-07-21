@@ -256,8 +256,11 @@ impl SharedRecorder {
 
     /// Stop the recording and return the file path.
     pub fn stop(&self) -> Result<PathBuf, String> {
-        let mut guard = self.inner.lock().map_err(|_| "Recorder lock poisoned".to_string())?;
-        match guard.take() {
+        let handle = {
+            let mut guard = self.inner.lock().map_err(|_| "Recorder lock poisoned".to_string())?;
+            guard.take()
+        };
+        match handle {
             Some(handle) => handle.stop(),
             None => Err("Recording already stopped".to_string()),
         }

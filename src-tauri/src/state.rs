@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::{Arc, Mutex};
 
 use crate::audio::AudioCaptureManager;
+use crate::capture_shutdown::CaptureLifecycle;
 use crate::context::ContextManager;
 use crate::tray::TrayManager;
 use crate::credentials::CredentialManager;
@@ -58,6 +59,7 @@ impl Default for ActiveScenario {
 pub struct AppState {
     pub database: Option<Arc<Mutex<DatabaseManager>>>,
     pub audio: Arc<Mutex<Option<AudioCaptureManager>>>,
+    pub capture_lifecycle: Arc<CaptureLifecycle>,
     pub stt: Option<Arc<Mutex<STTRouter>>>,
     pub llm: Option<Arc<Mutex<LLMRouter>>>,
     pub intelligence: Option<Arc<Mutex<IntelligenceEngine>>>,
@@ -110,6 +112,7 @@ impl AppState {
         Self {
             database: None,
             audio: Arc::new(Mutex::new(Some(AudioCaptureManager::new()))),
+            capture_lifecycle: Arc::new(CaptureLifecycle::default()),
             stt: None,
             llm: None,
             intelligence: None,

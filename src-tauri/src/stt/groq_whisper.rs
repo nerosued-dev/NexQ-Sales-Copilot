@@ -24,6 +24,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Instant;
 use tauri::AppHandle;
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 
 use crate::audio::AudioChunk;
 use crate::stt::provider::{STTProvider, STTProviderType, TranscriptResult};
@@ -49,6 +50,7 @@ macro_rules! transcript_diag {
 
 /// Sample rate expected by the audio pipeline (16 kHz mono).
 const SAMPLE_RATE: u32 = 16000;
+const GROQ_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// RMS threshold for i16 PCM silence detection.
 /// Segments with RMS below this are considered silence and skipped.
@@ -171,6 +173,8 @@ pub struct GroqWhisperSTT {
     party: String,
     /// Channel to send results to the utterance accumulator task.
     accumulator_tx: Option<mpsc::Sender<AccumulatorMsg>>,
+    accumulator_task: Option<JoinHandle<()>>,
+    request_tasks: Vec<JoinHandle<Result<(), String>>>,
     /// Debug-only sequence source for correlating request lifecycle logs.
     /// It is never persisted, emitted, or read by functional logic.
     diag_request_counter: u64,
@@ -193,6 +197,8 @@ impl GroqWhisperSTT {
             app_handle: None,
             party: String::new(),
             accumulator_tx: None,
+            accumulator_task: None,
+            request_tasks: Vec::new(),
             diag_request_counter: 0,
         }
     }
@@ -317,7 +323,7 @@ impl GroqWhisperSTT {
         config: &GroqConfig,
         samples: Vec<i16>,
         app_handle: Option<&AppHandle>,
-    ) -> Option<String> {
+    ) -> Result<Option<String>, String> {
         let duration_secs = samples.len() as f32 / SAMPLE_RATE as f32;
         let wav_data = Self::encode_wav(&samples);
         let wav_size_kb = wav_data.len() / 1024;
@@ -334,7 +340,10 @@ impl GroqWhisperSTT {
             );
         }
 
-        let client = reqwest::Client::new();
+        let client = reqwest::Client::builder()
+            .timeout(GROQ_REQUEST_TIMEOUT)
+            .build()
+            .map_err(|_| "Groq HTTP client initialization failed".to_string())?;
         let file_part = reqwest::multipart::Part::bytes(wav_data)
             .file_name("audio.wav")
             .mime_str("audio/wav")
@@ -395,7 +404,7 @@ impl GroqWhisperSTT {
                                             ),
                                         );
                                     }
-                                    return Some(text);
+                                    return Ok(Some(text));
                                 }
                             }
                             if let Some(handle) = app_handle {
@@ -417,6 +426,7 @@ impl GroqWhisperSTT {
                                     &format!("Failed to parse API response: {}", e),
                                 );
                             }
+                            return Err("Groq returned an invalid transcription response".to_string());
                         }
                     }
                 } else {
@@ -435,6 +445,7 @@ impl GroqWhisperSTT {
                             &format!("API error {} ({} response bytes)", status, body.len()),
                         );
                     }
+                    return Err(format!("Groq transcription request failed with status {}", status));
                 }
             }
             Err(e) => {
@@ -447,10 +458,11 @@ impl GroqWhisperSTT {
                         &format!("Request failed: {}", e),
                     );
                 }
+                return Err("Groq transcription request failed".to_string());
             }
         }
 
-        None
+        Ok(None)
     }
 }
 
@@ -495,7 +507,7 @@ impl STTProvider for GroqWhisperSTT {
         let app_handle = self.app_handle.clone();
         let accumulator_party = self.party.clone();
 
-        tokio::spawn(async move {
+        self.accumulator_task = Some(tokio::spawn(async move {
             let mut utt_counter: u64 = 0;
             let mut utt_text = String::new();
             let mut utt_id = String::new();
@@ -619,7 +631,7 @@ impl STTProvider for GroqWhisperSTT {
                     utt_counter
                 );
             }
-        });
+        }));
 
         self.is_streaming = true;
         self.stop_flag.store(false, Ordering::SeqCst);
@@ -628,6 +640,7 @@ impl STTProvider for GroqWhisperSTT {
         self.segment_counter = 0;
         self.chunks_fed = 0;
         self.diag_request_counter = 0;
+        self.request_tasks.clear();
 
         self.emit_debug("info", "Stream started — accumulating audio for batch send");
         Ok(())
@@ -739,7 +752,7 @@ impl STTProvider for GroqWhisperSTT {
             let request_party = self.party.clone();
             let audio_duration_secs = segment.len() as f32 / SAMPLE_RATE as f32;
 
-            tokio::spawn(async move {
+            let request_task = tokio::spawn(async move {
                 transcript_diag!(
                     "event=request_started requestId={} party={} requestType=normal audioDurationSecs={:.3}",
                     request_id,
@@ -752,11 +765,11 @@ impl STTProvider for GroqWhisperSTT {
                     "event=request_completed requestId={} party={} requestType=normal outcome={}",
                     request_id,
                     request_party,
-                    if text.is_some() { "result" } else { "empty_or_failed" }
+                    if matches!(text, Ok(Some(_))) { "result" } else { "empty_or_failed" }
                 );
 
                 match text {
-                    Some(t) if !Self::is_hallucination(&t) => {
+                    Ok(Some(t)) if !Self::is_hallucination(&t) => {
                         let _ = acc_tx
                             .send(AccumulatorMsg::Speech {
                                 text: t,
@@ -769,7 +782,7 @@ impl STTProvider for GroqWhisperSTT {
                             request_party
                         );
                     }
-                    Some(_t) => {
+                    Ok(Some(_t)) => {
                         // Hallucination detected — treat as silence
                         if let Some(ref handle) = app_handle {
                             super::emit_stt_debug(
@@ -786,7 +799,7 @@ impl STTProvider for GroqWhisperSTT {
                             request_party
                         );
                     }
-                    None => {
+                    Ok(None) => {
                         // API error or empty result
                         let _ = acc_tx.send(AccumulatorMsg::Silence).await;
                         transcript_diag!(
@@ -795,8 +808,14 @@ impl STTProvider for GroqWhisperSTT {
                             request_party
                         );
                     }
+                    Err(error) => {
+                        let _ = acc_tx.send(AccumulatorMsg::Silence).await;
+                        return Err(error);
+                    }
                 }
+                Ok(())
             });
+            self.request_tasks.push(request_task);
         }
 
         Ok(())
@@ -816,6 +835,18 @@ impl STTProvider for GroqWhisperSTT {
         );
 
         self.stop_flag.store(true, Ordering::SeqCst);
+
+        let mut first_error = None;
+        for task in self.request_tasks.drain(..) {
+            let error = match task.await {
+                Ok(Ok(())) => None,
+                Ok(Err(error)) => Some(error),
+                Err(_) => Some("Groq transcription task terminated unexpectedly".to_string()),
+            };
+            if first_error.is_none() {
+                first_error = error;
+            }
+        }
 
         // Flush remaining audio buffer (if at least 0.5s of audio)
         let min_flush_samples = (SAMPLE_RATE as f32 * 0.5) as usize;
@@ -861,11 +892,11 @@ impl STTProvider for GroqWhisperSTT {
                     "event=request_completed requestId={} party={} requestType=residual outcome={}",
                     request_id,
                     self.party,
-                    if text.is_some() { "result" } else { "empty_or_failed" }
+                    if matches!(text, Ok(Some(_))) { "result" } else { "empty_or_failed" }
                 );
 
-                if let Some(t) = text {
-                    if !Self::is_hallucination(&t) {
+                match text {
+                    Ok(Some(t)) if !Self::is_hallucination(&t) => {
                         if let Some(ref tx) = self.accumulator_tx {
                             let _ = tx
                                 .send(AccumulatorMsg::Speech {
@@ -878,6 +909,12 @@ impl STTProvider for GroqWhisperSTT {
                                 request_id,
                                 self.party
                             );
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        if first_error.is_none() {
+                            first_error = Some(error);
                         }
                     }
                 }
@@ -896,13 +933,21 @@ impl STTProvider for GroqWhisperSTT {
 
         // Drop channels to let the accumulator task finish
         self.accumulator_tx = None;
+        if let Some(task) = self.accumulator_task.take() {
+            if task.await.is_err() && first_error.is_none() {
+                first_error = Some("Groq transcript accumulator terminated unexpectedly".to_string());
+            }
+        }
         self.audio_buffer.clear();
         self.is_streaming = false;
         self.result_tx = None;
         self.start_time = None;
 
         self.emit_debug("info", "Stream stopped");
-        Ok(())
+        match first_error {
+            Some(error) => Err(error.into()),
+            None => Ok(()),
+        }
     }
 
     async fn test_connection(&self) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {

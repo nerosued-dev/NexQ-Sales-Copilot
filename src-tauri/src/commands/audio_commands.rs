@@ -8,6 +8,8 @@ use crate::audio::device_manager;
 use crate::audio::session_monitor;
 use crate::audio::vad::{calculate_peak, calculate_rms, VoiceActivityDetector};
 use crate::audio::{AudioCaptureManager, AudioLevel, AudioSource};
+use crate::capture_shutdown::{new_shared_transcript, upsert_segment, ActiveCaptureRuntime,
+    CaptureShutdownResult, CaptureTranscriptSegment, SharedTranscript, StopDecision};
 use crate::stt::provider::STTProvider;
 use crate::state::AppState;
 
@@ -28,6 +30,19 @@ macro_rules! transcript_diag {
             format_args!($($arg)*)
         );
     };
+}
+
+fn emit_transcript_segment(
+    app: &AppHandle,
+    transcript: &SharedTranscript,
+    event_name: &str,
+    segment: CaptureTranscriptSegment,
+) -> Result<(), String> {
+    upsert_segment(transcript, segment.clone())?;
+    if app.emit(event_name, serde_json::json!({ "segment": segment })).is_err() {
+        log::warn!("Transcript event delivery failed");
+    }
+    Ok(())
 }
 
 /// List all available audio input and output devices.
@@ -61,6 +76,8 @@ pub async fn start_capture(
 
     // Create the audio chunk channel
     let (tx, mut rx) = mpsc::channel::<crate::audio::AudioChunk>(256);
+    let shutdown_transcript = new_shared_transcript();
+    let mut transcript_tasks = Vec::new();
 
     // Initialize and start the manager
     {
@@ -175,7 +192,8 @@ pub async fn start_capture(
         let stt_app = app.clone();
         let intel_arc = app.state::<AppState>().intelligence.clone();
         let pause_threshold = app.state::<AppState>().pause_threshold_ms.clone();
-        tokio::spawn(async move {
+        let transcript = shutdown_transcript.clone();
+        transcript_tasks.push(tokio::spawn(async move {
             use std::sync::atomic::Ordering;
             let threshold = pause_threshold.load(Ordering::Relaxed);
             let mut accumulator =
@@ -199,17 +217,13 @@ pub async fn start_capture(
                         output.id,
                         output.is_final
                     );
-                    let payload = serde_json::json!({
-                        "segment": {
-                            "id": output.id,
-                            "text": output.text,
-                            "speaker": output.speaker,
-                            "timestamp_ms": output.timestamp_ms,
-                            "is_final": output.is_final,
-                            "confidence": output.confidence
-                        }
-                    });
-                    let _ = stt_app.emit(event_name, &payload);
+                    emit_transcript_segment(&stt_app, &transcript, event_name,
+                        CaptureTranscriptSegment {
+                            id: output.id.clone(), text: output.text.clone(),
+                            speaker: output.speaker.clone(), timestamp_ms: output.timestamp_ms,
+                            is_final: output.is_final, confidence: output.confidence,
+                            speaker_id: None,
+                        })?;
 
                     // Push final segments to the intelligence engine's
                     // transcript buffer so the AI has access to what "Them" said.
@@ -227,7 +241,8 @@ pub async fn start_capture(
                     }
                 }
             }
-        });
+            Ok(())
+        }));
     }
 
     // Grab the recorder handle for WAV recording (with mic/system mixing)
@@ -239,7 +254,7 @@ pub async fn start_capture(
     // Audio processing task: levels + recording + system STT feed
     // (Mic STT is handled by Web Speech API in the frontend)
     let app_handle = app.clone();
-    tokio::spawn(async move {
+    let pipeline_task = tokio::spawn(async move {
         let mut vad = VoiceActivityDetector::new();
         let mut mic_emit_counter: u32 = 0;
         let mut system_emit_counter: u32 = 0;
@@ -347,14 +362,22 @@ pub async fn start_capture(
         // Clean shutdown
         if let Some(ref mut provider) = system_stt_provider {
             transcript_diag!("event=stop_stream_entered party=Them pipeline=legacy");
-            let _ = provider.stop_stream().await;
+            provider.stop_stream().await
+                .map_err(|_| "System transcription shutdown failed".to_string())?;
             transcript_diag!("event=stop_stream_returned party=Them pipeline=legacy");
         } else {
             transcript_diag!("event=stop_stream_skipped party=Them pipeline=legacy");
         }
         transcript_diag!("event=audio_processing_task_finished pipeline=legacy");
         log::info!("Audio processing task exiting");
+        Ok(())
     });
+
+    state.capture_lifecycle.start(ActiveCaptureRuntime {
+        pipeline_task,
+        transcript_tasks,
+        transcript: shutdown_transcript,
+    })?;
 
     log::info!("Audio capture started via command");
     Ok(())
@@ -362,7 +385,7 @@ pub async fn start_capture(
 
 /// Stop all audio capture.
 #[command]
-pub async fn stop_capture(app: AppHandle) -> Result<(), String> {
+pub async fn stop_capture(app: AppHandle) -> Result<CaptureShutdownResult, String> {
     let state = app.state::<AppState>();
     let capture_active = state
         .audio
@@ -375,50 +398,69 @@ pub async fn stop_capture(app: AppHandle) -> Result<(), String> {
         capture_active
     );
 
-    // Restore original default capture device if IPolicyConfig override was active
-    restore_default_device_if_overridden(&state, &app);
+    match state.capture_lifecycle.begin_stop()? {
+        StopDecision::Empty => Ok(CaptureShutdownResult::default()),
+        StopDecision::Complete(outcome) => outcome,
+        StopDecision::Follower(receiver) =>
+            crate::capture_shutdown::wait_for_stop_result(receiver).await,
+        StopDecision::Leader { runtime, result_tx } => {
+            restore_default_device_if_overridden(&state, &app);
 
-    let recording_info = {
-        let mut guard = state
-            .audio
-            .lock()
-            .map_err(|_| "Audio state lock poisoned".to_string())?;
+            let producer_shutdown = match state.audio.lock() {
+                Ok(mut guard) => match guard.as_mut() {
+                    Some(mgr) => Ok(mgr.begin_stop_capture()),
+                    None => Ok(None),
+                },
+                Err(_) => Err("Audio capture state is unavailable".to_string()),
+            };
+            let producer_shutdown = match producer_shutdown {
+                Ok(shutdown) => shutdown,
+                Err(error) => {
+                    let outcome = Err(error);
+                    state.capture_lifecycle.complete_stop(result_tx, outcome.clone())?;
+                    return outcome;
+                }
+            };
 
-        match guard.as_mut() {
-            Some(mgr) => {
-                transcript_diag!(
-                    "event=stop_capture_manager_call_before captureActive={}",
-                    mgr.is_capturing()
-                );
-                let info = mgr.stop_capture();
-                transcript_diag!(
-                    "event=stop_capture_manager_call_after captureActive={}",
-                    mgr.is_capturing()
-                );
-                log::info!("Audio capture stopped via command");
-                info
+            let (producer_shutdown, producer_error) = match producer_shutdown {
+                Some(mut shutdown) => match tokio::task::spawn_blocking(move || {
+                    let error = shutdown.join_producers().err();
+                    (Some(shutdown), error)
+                }).await {
+                    Ok(result) => result,
+                    Err(_) => (None, Some("Audio producer shutdown terminated unexpectedly".to_string())),
+                },
+                None => (None, None),
+            };
+
+            let mut outcome = runtime.shutdown().await;
+            if outcome.is_ok() {
+                if let Some(error) = producer_error { outcome = Err(error); }
             }
-            None => return Err("No audio manager initialized".to_string()),
+
+            if let Some(shutdown) = producer_shutdown {
+                let recording_info = tokio::task::spawn_blocking(move || shutdown.finish_recording())
+                    .await.map_err(|_| "Audio recording shutdown terminated unexpectedly".to_string());
+                match recording_info {
+                    Ok(Some((wav_path, start_time_ms))) => {
+                        let pending_result = state.pending_recording.lock()
+                            .map_err(|_| "Pending recording state is unavailable".to_string())
+                            .map(|mut pending| *pending = Some(crate::state::PendingRecording {
+                                wav_path, start_time_ms,
+                            }));
+                        if let Err(error) = pending_result { outcome = Err(error); }
+                    }
+                    Ok(None) => {}
+                    Err(_) if outcome.is_ok() => outcome = Err("Audio recording shutdown failed".to_string()),
+                    Err(_) => {}
+                }
+            }
+
+            state.capture_lifecycle.complete_stop(result_tx, outcome.clone())?;
+            transcript_diag!("event=stop_capture_returning");
+            outcome
         }
-    };
-
-    // Store recording info for end_meeting to pick up.
-    // The frontend calls stopCapture() then endMeeting() in sequence, so
-    // we park the info here and end_meeting consumes it.
-    if let Some((wav_path, start_time_ms)) = recording_info {
-        let mut pending = state
-            .pending_recording
-            .lock()
-            .map_err(|_| "Pending recording lock poisoned".to_string())?;
-        *pending = Some(crate::state::PendingRecording {
-            wav_path,
-            start_time_ms,
-        });
-        log::info!("Recording info stored for post-meeting pipeline");
     }
-
-    transcript_diag!("event=stop_capture_returning");
-    Ok(())
 }
 
 /// Get current audio levels for UI meters.
@@ -863,23 +905,13 @@ pub async fn start_capture_per_party(
 
     let state = app.state::<AppState>();
 
-    // If already capturing, stop first (allows mid-meeting hot-swap)
-    {
-        // Restore any previous IPolicyConfig override before hot-swap
-        restore_default_device_if_overridden(&state, &app);
-
-        let mut guard = state
-            .audio
-            .lock()
-            .map_err(|_| "Audio state lock poisoned".to_string())?;
-        if let Some(ref mut mgr) = *guard {
-            if mgr.is_capturing() {
-                log::info!("start_capture_per_party: stopping existing capture for hot-swap");
-                crate::stt::emit_stt_debug(&app, "info", "stt",
-                    "Hot-swap: stopping existing audio capture + STT providers");
-                mgr.stop_capture();
-            }
-        }
+    let capture_active = state.audio.lock()
+        .map_err(|_| "Audio state lock poisoned".to_string())?
+        .as_ref().map(AudioCaptureManager::is_capturing).unwrap_or(false);
+    if capture_active {
+        crate::stt::emit_stt_debug(&app, "info", "stt",
+            "Hot-swap: stopping existing audio capture + STT providers");
+        stop_capture(app.clone()).await?;
     }
 
     log::info!(
@@ -894,6 +926,8 @@ pub async fn start_capture_per_party(
 
     // Create the audio chunk channel
     let (tx, mut rx) = mpsc::channel::<crate::audio::AudioChunk>(256);
+    let shutdown_transcript = new_shared_transcript();
+    let mut transcript_tasks = Vec::new();
 
     // Use the existing AudioCaptureManager for the physical capture
     // Map "You" → mic device, "Them" → system device (backward compat with existing manager)
@@ -1091,6 +1125,7 @@ pub async fn start_capture_per_party(
     // and whisper_cpp (dual-pass engine manages its own line breaking).
     if you_stt_provider.is_some() {
         let stt_app = app.clone();
+        let transcript = shutdown_transcript.clone();
         let prefix = session_prefix.clone();
         let use_accumulator = you.stt_provider != "web_speech"
             && you.stt_provider != "whisper_cpp";
@@ -1099,7 +1134,7 @@ pub async fn start_capture_per_party(
         } else {
             None
         };
-        tokio::spawn(async move {
+        transcript_tasks.push(tokio::spawn(async move {
             if let Some(pause_threshold) = pause_threshold {
                 // Accumulator path: merge same-speaker segments
                 use std::sync::atomic::Ordering;
@@ -1125,17 +1160,12 @@ pub async fn start_capture_per_party(
                             seg_id,
                             output.is_final
                         );
-                        let payload = serde_json::json!({
-                            "segment": {
-                                "id": seg_id,
-                                "text": output.text,
-                                "speaker": "User",
-                                "timestamp_ms": output.timestamp_ms,
-                                "is_final": output.is_final,
-                                "confidence": output.confidence
-                            }
-                        });
-                        let _ = stt_app.emit(event_name, &payload);
+                        emit_transcript_segment(&stt_app, &transcript, event_name,
+                            CaptureTranscriptSegment {
+                                id: seg_id, text: output.text, speaker: "User".to_string(),
+                                timestamp_ms: output.timestamp_ms, is_final: output.is_final,
+                                confidence: output.confidence, speaker_id: None,
+                            })?;
                     }
                 }
 
@@ -1146,17 +1176,12 @@ pub async fn start_capture_per_party(
                         "event=transcript_event_emitting pipeline=per_party party=You eventType=transcript_final segmentId={} isFinal=true trigger=channel_closed",
                         seg_id
                     );
-                    let payload = serde_json::json!({
-                        "segment": {
-                            "id": seg_id,
-                            "text": output.text,
-                            "speaker": "User",
-                            "timestamp_ms": output.timestamp_ms,
-                            "is_final": true,
-                            "confidence": output.confidence
-                        }
-                    });
-                    let _ = stt_app.emit("transcript_final", &payload);
+                    emit_transcript_segment(&stt_app, &transcript, "transcript_final",
+                        CaptureTranscriptSegment {
+                            id: seg_id, text: output.text, speaker: "User".to_string(),
+                            timestamp_ms: output.timestamp_ms, is_final: true,
+                            confidence: output.confidence, speaker_id: None,
+                        })?;
                 }
             } else {
                 // Direct path: web_speech / whisper_cpp handle their own segmentation
@@ -1185,20 +1210,16 @@ pub async fn start_capture_per_party(
                         seg_id,
                         result.is_final
                     );
-                    let payload = serde_json::json!({
-                        "segment": {
-                            "id": seg_id,
-                            "text": result.text,
-                            "speaker": "User",
-                            "timestamp_ms": result.timestamp_ms,
-                            "is_final": result.is_final,
-                            "confidence": result.confidence
-                        }
-                    });
-                    let _ = stt_app.emit(event_name, &payload);
+                    emit_transcript_segment(&stt_app, &transcript, event_name,
+                        CaptureTranscriptSegment {
+                            id: seg_id, text: result.text, speaker: "User".to_string(),
+                            timestamp_ms: result.timestamp_ms, is_final: result.is_final,
+                            confidence: result.confidence, speaker_id: result.speaker,
+                        })?;
                 }
             }
-        });
+            Ok(())
+        }));
     }
 
     // Emit transcript events from "Them" STT (speaker = "Them")
@@ -1206,10 +1227,11 @@ pub async fn start_capture_per_party(
     // within the configurable pause threshold, producing longer lines.
     if them_stt_provider.is_some() {
         let stt_app = app.clone();
+        let transcript = shutdown_transcript.clone();
         let prefix = session_prefix.clone();
         let intel_arc = app.state::<AppState>().intelligence.clone();
         let pause_threshold = app.state::<AppState>().pause_threshold_ms.clone();
-        tokio::spawn(async move {
+        transcript_tasks.push(tokio::spawn(async move {
             use std::sync::atomic::Ordering;
             let threshold = pause_threshold.load(Ordering::Relaxed);
             let mut accumulator =
@@ -1241,19 +1263,12 @@ pub async fn start_capture_per_party(
                     } else {
                         None
                     };
-                    let mut seg = serde_json::json!({
-                        "id": seg_id,
-                        "text": output.text,
-                        "speaker": "Them",
-                        "timestamp_ms": output.timestamp_ms,
-                        "is_final": output.is_final,
-                        "confidence": output.confidence
-                    });
-                    if let Some(ref sid) = speaker_id_val {
-                        seg["speaker_id"] = serde_json::json!(sid);
-                    }
-                    let payload = serde_json::json!({ "segment": seg });
-                    let _ = stt_app.emit(event_name, &payload);
+                    emit_transcript_segment(&stt_app, &transcript, event_name,
+                        CaptureTranscriptSegment {
+                            id: seg_id, text: output.text.clone(), speaker: "Them".to_string(),
+                            timestamp_ms: output.timestamp_ms, is_final: output.is_final,
+                            confidence: output.confidence, speaker_id: speaker_id_val,
+                        })?;
 
                     // Push final segments to the intelligence engine
                     if output.is_final {
@@ -1283,19 +1298,12 @@ pub async fn start_capture_per_party(
                 } else {
                     None
                 };
-                let mut seg = serde_json::json!({
-                    "id": seg_id,
-                    "text": output.text,
-                    "speaker": "Them",
-                    "timestamp_ms": output.timestamp_ms,
-                    "is_final": output.is_final,
-                    "confidence": output.confidence
-                });
-                if let Some(ref sid) = speaker_id_val {
-                    seg["speaker_id"] = serde_json::json!(sid);
-                }
-                let payload = serde_json::json!({ "segment": seg });
-                let _ = stt_app.emit("transcript_final", &payload);
+                emit_transcript_segment(&stt_app, &transcript, "transcript_final",
+                    CaptureTranscriptSegment {
+                        id: seg_id, text: output.text.clone(), speaker: "Them".to_string(),
+                        timestamp_ms: output.timestamp_ms, is_final: true,
+                        confidence: output.confidence, speaker_id: speaker_id_val,
+                    })?;
 
                 if let Some(ref intel) = intel_arc {
                     if let Ok(mut engine) = intel.lock() {
@@ -1308,7 +1316,8 @@ pub async fn start_capture_per_party(
                     }
                 }
             }
-        });
+            Ok(())
+        }));
     }
 
     // Grab the recorder handle for WAV recording (with mic/system mixing)
@@ -1323,7 +1332,7 @@ pub async fn start_capture_per_party(
 
     // Audio processing task: levels + recording + STT feed per party
     let app_handle = app.clone();
-    tokio::spawn(async move {
+    let pipeline_task = tokio::spawn(async move {
         // Separate VAD instances per audio source — sharing one VAD across
         // interleaved mic + system chunks corrupts smoothed_energy state.
         let mut mic_vad = VoiceActivityDetector::new();
@@ -1516,16 +1525,21 @@ pub async fn start_capture_per_party(
         }
 
         // Clean shutdown
+        let mut shutdown_error = None;
         if let Some(ref mut provider) = you_stt_provider {
             transcript_diag!("event=stop_stream_entered party=You");
-            let _ = provider.stop_stream().await;
+            if provider.stop_stream().await.is_err() {
+                shutdown_error = Some("You transcription shutdown failed".to_string());
+            }
             transcript_diag!("event=stop_stream_returned party=You");
         } else {
             transcript_diag!("event=stop_stream_skipped party=You");
         }
         if let Some(ref mut provider) = them_stt_provider {
             transcript_diag!("event=stop_stream_entered party=Them");
-            let _ = provider.stop_stream().await;
+            if provider.stop_stream().await.is_err() && shutdown_error.is_none() {
+                shutdown_error = Some("Them transcription shutdown failed".to_string());
+            }
             transcript_diag!("event=stop_stream_returned party=Them");
         } else {
             transcript_diag!("event=stop_stream_skipped party=Them");
@@ -1544,7 +1558,17 @@ pub async fn start_capture_per_party(
 
         transcript_diag!("event=audio_processing_task_finished pipeline=per_party");
         log::info!("Per-party audio processing task exiting");
+        match shutdown_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     });
+
+    state.capture_lifecycle.start(ActiveCaptureRuntime {
+        pipeline_task,
+        transcript_tasks,
+        transcript: shutdown_transcript,
+    })?;
 
     log::info!("Per-party audio capture started");
     Ok(())

@@ -36,6 +36,38 @@ macro_rules! transcript_diag {
 use crate::audio::recorder::SharedRecorder;
 use crate::audio::vad::VoiceActivityDetector;
 
+pub struct AudioCaptureShutdown {
+    system_thread: Option<std::thread::JoinHandle<()>>,
+    recorder: Option<SharedRecorder>,
+}
+
+impl AudioCaptureShutdown {
+    pub fn join_producers(&mut self) -> Result<(), String> {
+        if let Some(thread) = self.system_thread.take() {
+            transcript_diag!("event=system_thread_join_started");
+            thread
+                .join()
+                .map_err(|_| "System audio producer terminated unexpectedly".to_string())?;
+            transcript_diag!("event=system_thread_join_finished");
+        } else {
+            transcript_diag!("event=system_thread_join_not_required");
+        }
+        Ok(())
+    }
+
+    pub fn finish_recording(mut self) -> Option<(std::path::PathBuf, u64)> {
+        let recorder = self.recorder.take()?;
+        let start_time_ms = recorder.start_time_ms;
+        match recorder.stop() {
+            Ok(path) => Some((path, start_time_ms)),
+            Err(error) => {
+                log::error!("Failed to stop recording: {}", error);
+                None
+            }
+        }
+    }
+}
+
 // ── Two-Party Model Types ──
 
 /// Which side of the meeting this party represents.
@@ -250,7 +282,7 @@ impl AudioCaptureManager {
 
     /// Stop all audio capture.
     /// Returns (wav_path, start_time_ms) if a recording was active.
-    pub fn stop_capture(&mut self) -> Option<(std::path::PathBuf, u64)> {
+    pub fn begin_stop_capture(&mut self) -> Option<AudioCaptureShutdown> {
         if !self.is_capturing {
             return None;
         }
@@ -273,17 +305,10 @@ impl AudioCaptureManager {
         transcript_diag!("event=system_input_stream_dropped");
 
         // Wait for system capture thread to finish (with timeout)
-        if let Some(thread) = self.system_thread.take() {
-            // Give the thread a moment to stop, then move on
-            transcript_diag!("event=system_thread_join_started");
-            let _ = thread.join();
-            transcript_diag!("event=system_thread_join_finished");
-        } else {
-            transcript_diag!("event=system_thread_join_not_required");
-        }
+        let system_thread = self.system_thread.take();
 
         // Stop recording — capture info for post-meeting pipeline
-        let recording_info = self.stop_recording_internal();
+        let recorder = self.recorder.take();
 
         // Reset VADs
         self.mic_vad.reset();
@@ -292,7 +317,15 @@ impl AudioCaptureManager {
         self.is_capturing = false;
         log::info!("Audio capture pipeline stopped");
 
-        recording_info
+        Some(AudioCaptureShutdown { system_thread, recorder })
+    }
+
+    pub fn stop_capture(&mut self) -> Option<(std::path::PathBuf, u64)> {
+        let mut shutdown = self.begin_stop_capture()?;
+        if let Err(error) = shutdown.join_producers() {
+            log::error!("Failed to join audio producer: {}", error);
+        }
+        shutdown.finish_recording()
     }
 
     /// Check if capture is active.
