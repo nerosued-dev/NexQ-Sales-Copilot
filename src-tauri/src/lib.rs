@@ -1,4 +1,5 @@
 pub mod audio;
+pub mod capture_shutdown;
 pub mod commands;
 pub mod context;
 pub mod credentials;
