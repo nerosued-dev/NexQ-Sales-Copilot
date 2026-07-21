@@ -85,6 +85,34 @@ A instrumentação temporária e a inspeção do fluxo confirmaram que:
 - A barra visual usa `RMS / 3000`, suavização EMA e escala logarítmica. Ela amplifica níveis baixos e não representa diretamente o gate RMS usado pelo provider Groq.
 - Não há correção implementada para detecção de voz, ruído, alucinações ou vazamento acústico neste momento.
 
+## Validação manual: barreira de encerramento
+
+A barreira determinística de encerramento foi validada novamente em uma chamada encerrada enquanto havia uma requisição Groq ativa. O teste confirmou a seguinte ordem:
+
+1. a requisição Groq em andamento terminou;
+2. o acumulador recebeu `Flush`;
+3. os tasks de transcript terminaram;
+4. `stop_capture_returning` ocorreu somente depois;
+5. todos os segmentos foram persistidos;
+6. `end_meeting` ocorreu por último.
+
+O encerramento no meio da fala também preservou os segmentos finais. Essa validação confirma que `stop_capture` não retorna antes das requisições e dos tasks pertencentes à captura encerrada terminarem.
+
+## Validação manual: gate de resposta Groq
+
+O gate baseado em `verbose_json` foi apenas parcialmente eficaz:
+
+- respostas contendo somente espaços ou pontuação isolada foram rejeitadas corretamente;
+- a resposta agora fornece metadados reais por segmento, incluindo `no_speech_prob` e `avg_logprob` quando presentes;
+- alucinações textuais plausíveis ainda foram aceitas como `Speech` durante aproximadamente o primeiro minuto sem fala humana no canal You;
+- no silêncio observado, `no_speech_prob` retornou `0.0` tanto para resultados rejeitados quanto para alucinações aceitas;
+- alucinações aceitas ocorreram com RMS baixo, incluindo valores aproximados de `110`, `116`, `138` e `199`;
+- `avg_logprob` das alucinações aceitas variou aproximadamente entre `-0.38` e `-0.65` em vários casos;
+- um som curto reproduzido pelo Windows no canal Them também foi convertido em texto inventado;
+- depois desses casos, fala normal nos canais You e Them continuou sendo transcrita.
+
+Portanto, os thresholds atuais de `no_speech_prob` e `avg_logprob` não distinguem de forma confiável silêncio real, ruído curto e fala humana nesse ambiente. O gate elimina artefatos simples de pontuação e melhora a observabilidade, mas não resolve as alucinações durante silêncio.
+
 ## Instrumentação temporária de diagnóstico
 
 Os logs `NEXQ_TRANSCRIPT_DIAG` registram somente metadados técnicos, como timestamps, janela, IDs técnicos, contagens, RMS, duração de lote e resultado das etapas. Os logs frontend ficam restritos ao modo de desenvolvimento e os logs Rust a builds de debug.
@@ -93,7 +121,15 @@ A instrumentação não altera a ordem funcional do encerramento, não adiciona 
 
 ## Próximo passo
 
-Auditar o fluxo de encerramento e a persistência de reuniões curtas antes de implementar qualquer correção. A auditoria deve acompanhar, no mínimo, a ordem entre parada da captura, conclusão das transcrições pendentes, chegada dos eventos ao frontend, flush dos segmentos finais, encerramento do registro da reunião e limpeza dos stores.
+Auditar um gate local anterior ao envio de áudio para a Groq. A auditoria deve incluir, no mínimo:
+
+- verificar por que `AudioChunk.is_speech` atualmente não controla o envio ao provider;
+- medir a proporção de frames classificados como voz em cada lote;
+- avaliar WebRTC VAD para decisões rápidas por frame;
+- avaliar Silero VAD para uma classificação local mais robusta;
+- criar fixtures com silêncio, ruído ambiente, sons curtos do Windows, fala curta e fala distante.
+
+Não tentar resolver o problema apenas aumentando thresholds RMS, `no_speech_prob` ou `avg_logprob`. Qualquer alteração futura de thresholds deve ser validada contra fala curta legítima e fala distante para evitar falsos negativos.
 
 ## Backlog posterior
 
