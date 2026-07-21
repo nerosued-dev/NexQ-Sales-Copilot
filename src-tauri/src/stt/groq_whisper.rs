@@ -28,7 +28,8 @@ use tokio::task::JoinHandle;
 
 use crate::audio::AudioChunk;
 use crate::stt::groq_response::{
-    normalize_response, parse_groq_response, NormalizedGroqTranscription,
+    decide_transcript_acceptance, normalize_response, parse_groq_response,
+    NormalizedGroqTranscription, TranscriptAcceptance,
 };
 use crate::stt::provider::{STTProvider, STTProviderType, TranscriptResult};
 
@@ -64,25 +65,6 @@ const GROQ_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 ///   - Quiet speech: 100-500
 ///   - Normal speech: 500-3000
 const SILENCE_RMS_THRESHOLD: f64 = 100.0;
-
-/// Known Whisper hallucination phrases produced on silent or near-silent audio.
-/// These are filtered out regardless of RMS to catch edge cases.
-const HALLUCINATION_PHRASES: &[&str] = &[
-    "thank you",
-    "thanks",
-    "thanks for watching",
-    "thank you for watching",
-    "you",
-    "bye",
-    "goodbye",
-    "the end",
-    "subtitle",
-    "subtitles",
-    "please subscribe",
-    "like and subscribe",
-    "thanks for listening",
-    "thank you for listening",
-];
 
 // ── Groq Configuration ──
 
@@ -127,11 +109,24 @@ impl Default for GroqConfig {
 /// pause-based newlines (like Deepgram's endpointing).
 enum AccumulatorMsg {
     /// A batch returned speech text — append to current utterance.
-    Speech { text: String, timestamp_ms: u64 },
+    Speech {
+        text: String,
+        confidence: Option<f32>,
+        timestamp_ms: u64,
+    },
     /// A batch was silent or a hallucination — may trigger utterance finalization.
     Silence,
     /// Stream ending — flush any accumulated text as final.
     Flush,
+}
+
+struct TranscriptionRequestContext<'a> {
+    party: &'a str,
+    request_id: u64,
+    request_type: &'a str,
+    audio_duration_secs: f32,
+    rms: f64,
+    app_handle: Option<&'a AppHandle>,
 }
 
 // ── GroqWhisperSTT provider ──
@@ -273,16 +268,6 @@ impl GroqWhisperSTT {
         (sum_sq / samples.len() as f64).sqrt()
     }
 
-    /// Check if text is a known Whisper hallucination on silent audio.
-    fn is_hallucination(text: &str) -> bool {
-        let lower = text.to_lowercase();
-        let trimmed = lower
-            .trim()
-            .trim_end_matches(|c: char| ".!?,…".contains(c))
-            .trim();
-        HALLUCINATION_PHRASES.iter().any(|&p| trimmed == p)
-    }
-
     /// Encode accumulated PCM i16 samples as a WAV byte buffer (16-bit mono 16 kHz).
     fn encode_wav(samples: &[i16]) -> Vec<u8> {
         let data_len = (samples.len() * 2) as u32;
@@ -381,9 +366,10 @@ impl GroqWhisperSTT {
         match response {
             Ok(resp) => {
                 if resp.status().is_success() {
-                    let body = resp.bytes().await.map_err(|_| {
-                        "Groq transcription response could not be read".to_string()
-                    })?;
+                    let body = resp
+                        .bytes()
+                        .await
+                        .map_err(|_| "Groq transcription response could not be read".to_string())?;
                     let parsed = parse_groq_response(&body).map_err(str::to_string)?;
                     let normalized = normalize_response(parsed);
                     if let Some(handle) = app_handle {
@@ -397,7 +383,7 @@ impl GroqWhisperSTT {
                             ),
                         );
                     }
-                    return Ok(normalized);
+                    Ok(normalized)
                 } else {
                     let status = resp.status();
                     let body = resp.text().await.unwrap_or_default();
@@ -414,7 +400,10 @@ impl GroqWhisperSTT {
                             &format!("API error {} ({} response bytes)", status, body.len()),
                         );
                     }
-                    return Err(format!("Groq transcription request failed with status {}", status));
+                    Err(format!(
+                        "Groq transcription request failed with status {}",
+                        status
+                    ))
                 }
             }
             Err(e) => {
@@ -427,7 +416,61 @@ impl GroqWhisperSTT {
                         &format!("Request failed: {}", e),
                     );
                 }
-                return Err("Groq transcription request failed".to_string());
+                Err("Groq transcription request failed".to_string())
+            }
+        }
+    }
+
+    async fn forward_transcription(
+        transcription: NormalizedGroqTranscription,
+        accumulator_tx: &mpsc::Sender<AccumulatorMsg>,
+        timestamp_ms: u64,
+        context: TranscriptionRequestContext<'_>,
+    ) {
+        let acceptance = decide_transcript_acceptance(&transcription);
+        let reason = acceptance
+            .reason()
+            .map(|value| value.as_str())
+            .unwrap_or("none");
+        transcript_diag!(
+            "event=response_decision requestId={} party={} requestType={} audioDurationSecs={:.3} rms={:.1} segmentCount={} avgLogprobPresent={} avgLogprob={:?} noSpeechProbPresent={} noSpeechProb={:?} compressionRatioPresent={} compressionRatio={:?} timestampsPresent={} decision={} reason={}",
+            context.request_id,
+            context.party,
+            context.request_type,
+            context.audio_duration_secs,
+            context.rms,
+            transcription.segment_count,
+            transcription.avg_logprob.is_some(),
+            transcription.avg_logprob,
+            transcription.no_speech_prob.is_some(),
+            transcription.no_speech_prob,
+            transcription.compression_ratio.is_some(),
+            transcription.compression_ratio,
+            transcription.has_timestamps,
+            acceptance.decision_name(),
+            reason
+        );
+
+        match acceptance {
+            TranscriptAcceptance::Speech { confidence } => {
+                let _ = accumulator_tx
+                    .send(AccumulatorMsg::Speech {
+                        text: transcription.text,
+                        confidence,
+                        timestamp_ms,
+                    })
+                    .await;
+            }
+            TranscriptAcceptance::Silence { .. } | TranscriptAcceptance::Rejected { .. } => {
+                if let Some(handle) = context.app_handle {
+                    super::emit_stt_debug(
+                        handle,
+                        "info",
+                        "groq",
+                        &format!("Transcription rejected ({reason})"),
+                    );
+                }
+                let _ = accumulator_tx.send(AccumulatorMsg::Silence).await;
             }
         }
     }
@@ -479,11 +522,13 @@ impl STTProvider for GroqWhisperSTT {
             let mut utt_text = String::new();
             let mut utt_id = String::new();
             let mut last_ts: u64 = 0;
+            let mut utt_confidence: Option<f32> = None;
 
             while let Some(msg) = acc_rx.recv().await {
                 match msg {
                     AccumulatorMsg::Speech {
                         text,
+                        confidence,
                         timestamp_ms,
                     } => {
                         // Start a new utterance if needed
@@ -504,13 +549,17 @@ impl STTProvider for GroqWhisperSTT {
                         }
                         utt_text.push_str(&text);
                         last_ts = timestamp_ms;
+                        utt_confidence = match (utt_confidence, confidence) {
+                            (Some(current), Some(next)) => Some(current.min(next)),
+                            (None, value) | (value, None) => value,
+                        };
 
                         // Emit as interim — frontend updates in-place (same line)
                         let _ = result_tx
                             .send(TranscriptResult {
                                 text: utt_text.clone(),
                                 is_final: false,
-                                confidence: 0.95,
+                                confidence: utt_confidence.unwrap_or(0.0),
                                 timestamp_ms,
                                 speaker: None,
                                 language: None,
@@ -543,7 +592,7 @@ impl STTProvider for GroqWhisperSTT {
                                 .send(TranscriptResult {
                                     text: utt_text.clone(),
                                     is_final: true,
-                                    confidence: 0.95,
+                                    confidence: utt_confidence.unwrap_or(0.0),
                                     timestamp_ms: last_ts,
                                     speaker: None,
                                     language: None,
@@ -558,6 +607,7 @@ impl STTProvider for GroqWhisperSTT {
                                 utt_counter
                             );
                             utt_text.clear();
+                            utt_confidence = None;
 
                             if let Some(ref handle) = app_handle {
                                 super::emit_stt_debug(
@@ -584,7 +634,7 @@ impl STTProvider for GroqWhisperSTT {
                     .send(TranscriptResult {
                         text: utt_text,
                         is_final: true,
-                        confidence: 0.95,
+                        confidence: utt_confidence.unwrap_or(0.0),
                         timestamp_ms: last_ts,
                         speaker: None,
                         language: None,
@@ -732,41 +782,29 @@ impl STTProvider for GroqWhisperSTT {
                     "event=request_completed requestId={} party={} requestType=normal outcome={}",
                     request_id,
                     request_party,
-                    if matches!(text, Ok(_)) { "result" } else { "failed" }
+                    if text.is_ok() {
+                        "result"
+                    } else {
+                        "failed"
+                    }
                 );
 
                 match text {
-                    Ok(transcription)
-                        if !transcription.text.is_empty()
-                            && !Self::is_hallucination(&transcription.text) => {
-                        let _ = acc_tx
-                            .send(AccumulatorMsg::Speech {
-                                text: transcription.text,
-                                timestamp_ms,
-                            })
-                            .await;
-                        transcript_diag!(
-                            "event=request_result_sent requestId={} party={} requestType=normal accumulatorMessage=speech",
-                            request_id,
-                            request_party
-                        );
-                    }
-                    Ok(_) => {
-                        // Hallucination detected — treat as silence
-                        if let Some(ref handle) = app_handle {
-                            super::emit_stt_debug(
-                                handle,
-                                "info",
-                                "groq",
-                                "Filtered hallucination",
-                            );
-                        }
-                        let _ = acc_tx.send(AccumulatorMsg::Silence).await;
-                        transcript_diag!(
-                            "event=request_result_sent requestId={} party={} requestType=normal accumulatorMessage=silence reason=hallucination",
-                            request_id,
-                            request_party
-                        );
+                    Ok(transcription) => {
+                        Self::forward_transcription(
+                            transcription,
+                            &acc_tx,
+                            timestamp_ms,
+                            TranscriptionRequestContext {
+                                party: &request_party,
+                                request_id,
+                                request_type: "normal",
+                                audio_duration_secs,
+                                rms,
+                                app_handle: app_handle.as_ref(),
+                            },
+                        )
+                        .await;
                     }
                     Err(error) => {
                         let _ = acc_tx.send(AccumulatorMsg::Silence).await;
@@ -852,28 +890,32 @@ impl STTProvider for GroqWhisperSTT {
                     "event=request_completed requestId={} party={} requestType=residual outcome={}",
                     request_id,
                     self.party,
-                    if matches!(text, Ok(_)) { "result" } else { "failed" }
+                    if text.is_ok() {
+                        "result"
+                    } else {
+                        "failed"
+                    }
                 );
 
                 match text {
-                    Ok(transcription)
-                        if !transcription.text.is_empty()
-                            && !Self::is_hallucination(&transcription.text) => {
+                    Ok(transcription) => {
                         if let Some(ref tx) = self.accumulator_tx {
-                            let _ = tx
-                                .send(AccumulatorMsg::Speech {
-                                    text: transcription.text,
-                                    timestamp_ms,
-                                })
-                                .await;
-                            transcript_diag!(
-                                "event=request_result_sent requestId={} party={} requestType=residual accumulatorMessage=speech",
-                                request_id,
-                                self.party
-                            );
+                            Self::forward_transcription(
+                                transcription,
+                                tx,
+                                timestamp_ms,
+                                TranscriptionRequestContext {
+                                    party: &self.party,
+                                    request_id,
+                                    request_type: "residual",
+                                    audio_duration_secs,
+                                    rms,
+                                    app_handle: self.app_handle.as_ref(),
+                                },
+                            )
+                            .await;
                         }
                     }
-                    Ok(_) => {}
                     Err(error) => {
                         if first_error.is_none() {
                             first_error = Some(error);
@@ -943,5 +985,49 @@ impl STTProvider for GroqWhisperSTT {
     fn set_language(&mut self, language: &str) {
         self.config.language = language.to_string();
         log::info!("GroqWhisperSTT: Language set to {}", self.config.language);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn silence_finalizes_an_open_partial_with_derived_confidence() {
+        let mut provider = GroqWhisperSTT::with_api_key("test-key");
+        let (result_tx, mut result_rx) = mpsc::channel(4);
+        provider.start_stream(result_tx).await.unwrap();
+
+        provider
+            .accumulator_tx
+            .as_ref()
+            .unwrap()
+            .send(AccumulatorMsg::Speech {
+                text: "sim".to_string(),
+                confidence: Some(0.73),
+                timestamp_ms: 42,
+            })
+            .await
+            .unwrap();
+
+        let partial = result_rx.recv().await.unwrap();
+        assert!(!partial.is_final);
+        assert_eq!(partial.confidence, 0.73);
+
+        provider
+            .accumulator_tx
+            .as_ref()
+            .unwrap()
+            .send(AccumulatorMsg::Silence)
+            .await
+            .unwrap();
+
+        let final_result = result_rx.recv().await.unwrap();
+        assert!(final_result.is_final);
+        assert_eq!(final_result.text, "sim");
+        assert_eq!(final_result.confidence, 0.73);
+        assert!(result_rx.try_recv().is_err());
+
+        provider.stop_stream().await.unwrap();
     }
 }

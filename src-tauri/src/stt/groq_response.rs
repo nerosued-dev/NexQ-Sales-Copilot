@@ -101,16 +101,19 @@ impl TranscriptAcceptance {
     }
 }
 
-pub(super) fn parse_groq_response(
-    body: &[u8],
-) -> Result<GroqTranscriptionResponse, &'static str> {
+pub(super) fn parse_groq_response(body: &[u8]) -> Result<GroqTranscriptionResponse, &'static str> {
     serde_json::from_slice(body).map_err(|_| "Groq returned an invalid transcription response")
 }
 
 pub(super) fn normalize_response(
     response: GroqTranscriptionResponse,
 ) -> NormalizedGroqTranscription {
-    let avg_logprob = finite_mean(response.segments.iter().filter_map(|segment| segment.avg_logprob));
+    let avg_logprob = finite_mean(
+        response
+            .segments
+            .iter()
+            .filter_map(|segment| segment.avg_logprob),
+    );
     let no_speech_prob = finite_mean(
         response
             .segments
@@ -160,7 +163,9 @@ fn confidence_from_metadata(transcription: &NormalizedGroqTranscription) -> Opti
             Some((avg_logprob.exp() * (1.0 - no_speech_prob.clamp(0.0, 1.0))).clamp(0.0, 1.0))
         }
         (Some(avg_logprob), None) => Some(avg_logprob.exp().clamp(0.0, 1.0)),
-        (None, Some(no_speech_prob)) => Some((1.0 - no_speech_prob.clamp(0.0, 1.0)).clamp(0.0, 1.0)),
+        (None, Some(no_speech_prob)) => {
+            Some((1.0 - no_speech_prob.clamp(0.0, 1.0)).clamp(0.0, 1.0))
+        }
         (None, None) => None,
     }
 }
@@ -185,9 +190,7 @@ pub(super) fn decide_transcript_acceptance(
     }
 
     match (transcription.no_speech_prob, transcription.avg_logprob) {
-        (Some(no_speech_prob), _)
-            if no_speech_prob >= HIGH_NO_SPEECH_PROBABILITY =>
-        {
+        (Some(no_speech_prob), _) if no_speech_prob >= HIGH_NO_SPEECH_PROBABILITY => {
             TranscriptAcceptance::Silence {
                 reason: RejectionReason::HighNoSpeechProbability,
             }
@@ -198,8 +201,7 @@ pub(super) fn decide_transcript_acceptance(
             }
         }
         (Some(no_speech_prob), Some(avg_logprob))
-            if no_speech_prob >= LOW_NO_SPEECH_PROBABILITY
-                && avg_logprob <= LOW_AVG_LOGPROB =>
+            if no_speech_prob >= LOW_NO_SPEECH_PROBABILITY && avg_logprob <= LOW_AVG_LOGPROB =>
         {
             TranscriptAcceptance::Silence {
                 reason: RejectionReason::CombinedNoSpeechSignals,
@@ -335,7 +337,9 @@ mod tests {
         let high = decide_transcript_acceptance(&transcription("sim", Some(-0.05), Some(0.01)));
         let lower = decide_transcript_acceptance(&transcription("sim", Some(-0.8), Some(0.2)));
         assert_ne!(high, lower);
-        assert!(!matches!(high, TranscriptAcceptance::Speech { confidence: Some(value) } if value == 0.95));
+        assert!(
+            !matches!(high, TranscriptAcceptance::Speech { confidence: Some(value) } if value == 0.95)
+        );
     }
 
     #[test]
