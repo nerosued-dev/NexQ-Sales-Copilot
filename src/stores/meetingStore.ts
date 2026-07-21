@@ -16,6 +16,14 @@ import {
   getTranscriptCounts,
   transcriptDiag,
 } from "../lib/transcriptDiagnostics";
+import {
+  createFinalPersistencePlan,
+  persistFinalTranscript,
+  withTranscriptPersistenceLock,
+} from "../lib/transcriptFinalization";
+
+type MeetingEndingState = "idle" | "stopping" | "failed";
+let activeEndMeetingFlow: Promise<void> | null = null;
 
 async function getCurrentWindowLabel(): Promise<string> {
   try {
@@ -37,6 +45,7 @@ interface MeetingState {
   isRecording: boolean;
   meetingStartTime: number | null;
   elapsedMs: number;
+  endingState: MeetingEndingState;
 
   // Meeting history
   recentMeetings: MeetingSummary[];
@@ -94,6 +103,7 @@ export const useMeetingStore = create<MeetingState>((set, get) => ({
   isRecording: false,
   meetingStartTime: null,
   elapsedMs: 0,
+  endingState: "idle",
   recentMeetings: [],
   lastPersistedIndex: 0,
   unfinishedMeeting: null,
@@ -208,6 +218,7 @@ export const useMeetingStore = create<MeetingState>((set, get) => ({
         isRecording: true,
         meetingStartTime: now,
         elapsedMs: 0,
+        endingState: "idle",
         lastPersistedIndex: 0,
       });
       transcriptDiag("meeting_started_state_reset", {
@@ -303,9 +314,12 @@ export const useMeetingStore = create<MeetingState>((set, get) => ({
     }
   },
 
-  endMeetingFlow: async () => {
+  endMeetingFlow: () => {
+    if (activeEndMeetingFlow) return activeEndMeetingFlow;
+    const operation = (async () => {
     const state = get();
     const meeting = state.activeMeeting;
+    set({ endingState: "stopping" });
     const windowLabel = await getCurrentWindowLabel();
     transcriptDiag("end_flow_entered", {
       meetingId: meeting?.id,
@@ -323,10 +337,13 @@ export const useMeetingStore = create<MeetingState>((set, get) => ({
     // 2. Stop audio capture
     transcriptDiag("end_stop_capture_before", { meetingId: meeting?.id });
     try {
-      await stopCapture();
+      const shutdownResult = await stopCapture();
+      useTranscriptStore.getState().mergeSegments(shutdownResult.segments);
+      set({ isRecording: false });
       transcriptDiag("end_stop_capture_returned", {
         meetingId: meeting?.id,
         succeeded: true,
+        returnedSegments: shutdownResult.segments.length,
       });
     } catch (err) {
       transcriptDiag("end_stop_capture_returned", {
@@ -334,65 +351,64 @@ export const useMeetingStore = create<MeetingState>((set, get) => ({
         succeeded: false,
         errorType: diagnosticErrorType(err),
       });
-      console.warn("[meetingStore] Audio capture failed to stop:", err);
+      set({ endingState: "failed" });
+      console.error("[meetingStore] Audio capture shutdown did not complete");
+      throw new Error("Audio capture shutdown did not complete");
     }
 
-    // 2b. Reset mute state — unmute both sources for next meeting
+    // 3. Flush all remaining transcript segments to DB before ending
+    if (meeting) {
+      try {
+        await withTranscriptPersistenceLock(async () => {
+          const segments = useTranscriptStore.getState().segments;
+          const lastIdx = get().lastPersistedIndex;
+          const plan = createFinalPersistencePlan(segments, lastIdx);
+          transcriptDiag("end_snapshot_read", {
+            meetingId: meeting.id,
+            lastPersistedIndex: lastIdx,
+            selected: plan.pending.length,
+            incomplete: plan.incompleteSegmentIds.length,
+            ...getTranscriptCounts(segments),
+          });
+
+          const { appendTranscriptSegment } = await import("../lib/ipc");
+          await persistFinalTranscript({
+            segments,
+            lastPersistedIndex: lastIdx,
+            persist: async (segment) => {
+              await appendTranscriptSegment(meeting.id, JSON.stringify(segment));
+            },
+            onPersisted: (nextIndex) => set({ lastPersistedIndex: nextIndex }),
+          });
+
+          const confirmation = createFinalPersistencePlan(
+            useTranscriptStore.getState().segments,
+            get().lastPersistedIndex
+          );
+          if (!confirmation.complete || confirmation.pending.length > 0) {
+            throw new Error("Transcript changed during final persistence");
+          }
+        });
+        transcriptDiag("end_flush_finished", {
+          meetingId: meeting.id,
+          succeeded: true,
+        });
+      } catch (err) {
+        set({ endingState: "failed" });
+        transcriptDiag("end_flush_finished", {
+          meetingId: meeting.id,
+          succeeded: false,
+          errorType: diagnosticErrorType(err),
+        });
+        console.error("[meetingStore] Final transcript persistence did not complete");
+        throw new Error("Final transcript persistence did not complete");
+      }
+    }
+
     const configStore = (await import("./configStore")).useConfigStore;
     const { mutedYou, mutedThem } = configStore.getState();
     if (mutedYou) configStore.getState().toggleMuteYou();
     if (mutedThem) configStore.getState().toggleMuteThem();
-
-    // 3. Flush all remaining transcript segments to DB before ending
-    let transcriptFlushSucceeded = true;
-    if (meeting) {
-      const segments = useTranscriptStore.getState().segments;
-      const lastIdx = get().lastPersistedIndex;
-      const unpersisted = segments.slice(lastIdx).filter((s) => s.is_final);
-      const counts = getTranscriptCounts(segments);
-      transcriptDiag("end_snapshot_read", {
-        meetingId: meeting.id,
-        lastPersistedIndex: lastIdx,
-        selected: unpersisted.length,
-        ...counts,
-      });
-      transcriptDiag("end_flush_started", {
-        meetingId: meeting.id,
-        selected: unpersisted.length,
-      });
-
-      for (const seg of unpersisted) {
-        transcriptDiag("end_insert_started", {
-          meetingId: meeting.id,
-          segmentId: seg.id,
-          isFinal: seg.is_final,
-        });
-        try {
-          const { appendTranscriptSegment } = await import("../lib/ipc");
-          await appendTranscriptSegment(meeting.id, JSON.stringify(seg));
-          transcriptDiag("end_insert_succeeded", {
-            meetingId: meeting.id,
-            segmentId: seg.id,
-            isFinal: seg.is_final,
-          });
-        } catch (err) {
-          transcriptFlushSucceeded = false;
-          transcriptDiag("end_insert_failed", {
-            meetingId: meeting.id,
-            segmentId: seg.id,
-            isFinal: seg.is_final,
-            errorType: diagnosticErrorType(err),
-          });
-          console.error("[meetingStore] Failed to persist segment:", err);
-          break;
-        }
-      }
-      transcriptDiag("end_flush_finished", {
-        meetingId: meeting.id,
-        selected: unpersisted.length,
-        succeeded: transcriptFlushSucceeded,
-      });
-    }
 
     // 4. Persist AI call log entries as AI interactions before ending
     transcriptDiag("end_aux_metadata_started", { meetingId: meeting?.id });
@@ -441,7 +457,9 @@ export const useMeetingStore = create<MeetingState>((set, get) => ({
           succeeded: false,
           errorType: diagnosticErrorType(err),
         });
-        console.error("[meetingStore] Failed to end meeting:", err);
+        set({ endingState: "failed" });
+        console.error("[meetingStore] Meeting record finalization did not complete");
+        throw new Error("Meeting record finalization did not complete");
       }
     }
 
@@ -562,17 +580,15 @@ export const useMeetingStore = create<MeetingState>((set, get) => ({
     transcriptDiag("end_transcript_reset_before", {
       meetingId: meeting?.id,
       segmentsBeforeReset,
-      flushSucceeded: transcriptFlushSucceeded,
+      flushSucceeded: true,
     });
-    if (transcriptFlushSucceeded) {
-      useTranscriptStore.getState().resetSession();
-    }
+    useTranscriptStore.getState().resetSession();
     const segmentsAfterReset = useTranscriptStore.getState().segments.length;
     transcriptDiag("end_transcript_reset_after", {
       meetingId: meeting?.id,
       segmentsBeforeReset,
       segmentsAfterReset,
-      resetPerformed: transcriptFlushSucceeded,
+      resetPerformed: true,
     });
 
     // Clear active state and persistence checkpoint before leaving the meeting view.
@@ -583,6 +599,7 @@ export const useMeetingStore = create<MeetingState>((set, get) => ({
       meetingStartTime: null,
       elapsedMs: 0,
       lastPersistedIndex: 0,
+      endingState: "idle",
       audioMode: "online",
       aiScenario: "team_meeting",
     });
@@ -592,7 +609,7 @@ export const useMeetingStore = create<MeetingState>((set, get) => ({
       newIndex: get().lastPersistedIndex,
     });
     console.info(
-      `[meetingLifecycle] [${windowLabel}] End meetingId=${meeting?.id ?? "none"} transcript reset ${segmentsBeforeReset} -> ${segmentsAfterReset} flushSucceeded=${transcriptFlushSucceeded}`
+      `[meetingLifecycle] [${windowLabel}] End meetingId=${meeting?.id ?? "none"} transcript reset ${segmentsBeforeReset} -> ${segmentsAfterReset} flushSucceeded=true`
     );
 
     // 9. Reload recent meetings
@@ -622,6 +639,11 @@ export const useMeetingStore = create<MeetingState>((set, get) => ({
         });
     });
     transcriptDiag("end_flow_exited", { meetingId: meeting?.id });
+    })();
+    activeEndMeetingFlow = operation.finally(() => {
+      activeEndMeetingFlow = null;
+    });
+    return activeEndMeetingFlow;
   },
 
   loadRecentMeetings: async () => {

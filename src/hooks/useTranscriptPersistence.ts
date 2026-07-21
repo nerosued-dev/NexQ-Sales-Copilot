@@ -7,6 +7,7 @@ import {
   getTranscriptCounts,
   transcriptDiag,
 } from "../lib/transcriptDiagnostics";
+import { withTranscriptPersistenceLock } from "../lib/transcriptFinalization";
 
 const FLUSH_INTERVAL_MS = 30_000; // 30 seconds
 
@@ -36,6 +37,8 @@ export function useTranscriptPersistence() {
     transcriptDiag("persistence_hook_mounted", { meetingId });
 
     async function flushSegments(reason: "timer" | "cleanup") {
+      if (useMeetingStore.getState().endingState !== "idle") return;
+      return withTranscriptPersistenceLock(async () => {
       const segments = useTranscriptStore.getState().segments;
       const currentLastIndex = useMeetingStore.getState().lastPersistedIndex;
       const counts = getTranscriptCounts(segments);
@@ -125,6 +128,7 @@ export function useTranscriptPersistence() {
         selected: newSegments.length,
         persisted: newSegments.length,
       });
+      });
     }
 
     // Set up the 30-second interval
@@ -133,12 +137,10 @@ export function useTranscriptPersistence() {
     }, FLUSH_INTERVAL_MS);
 
     return () => {
-      // On cleanup, do a final flush
       transcriptDiag("persistence_hook_cleanup", {
         meetingId,
-        asyncFlushAwaited: false,
+        finalFlushOwnedByMeetingFlow: true,
       });
-      void flushSegments("cleanup");
 
       if (intervalRef.current) {
         clearInterval(intervalRef.current);
