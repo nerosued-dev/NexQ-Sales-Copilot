@@ -1,5 +1,6 @@
 import { create } from "zustand";
 import type { TranscriptSegment } from "../lib/types";
+import { mergeTranscriptSegments } from "../lib/transcriptFinalization";
 
 interface TranscriptState {
   segments: TranscriptSegment[];
@@ -9,6 +10,7 @@ interface TranscriptState {
   // Actions
   appendSegment: (segment: TranscriptSegment) => void;
   updateInterimSegment: (segment: TranscriptSegment) => void;
+  mergeSegments: (segments: TranscriptSegment[]) => void;
   finalizeAllInterim: () => void;
   clearSegments: () => void;
   resetSession: () => void;
@@ -54,6 +56,11 @@ export const useTranscriptStore = create<TranscriptState>((set) => ({
       searchQuery: "",
       autoScroll: true,
     }),
+
+  mergeSegments: (segments) =>
+    set((state) => ({
+      segments: mergeTranscriptSegments(state.segments, segments),
+    })),
   setSearchQuery: (query) => set({ searchQuery: query }),
   setAutoScroll: (auto) => set({ autoScroll: auto }),
   reassignSpeaker: (fromId, toId) =>

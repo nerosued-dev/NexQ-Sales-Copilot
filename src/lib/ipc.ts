@@ -11,6 +11,7 @@ import type {
   ContextResource,
   DeepgramConfig,
   GroqConfig,
+  CaptureShutdownResult,
   IpolicyStatus,
   LocalSTTEngineInfo,
   Meeting,
@@ -49,8 +50,8 @@ export async function startCapture(
   });
 }
 
-export async function stopCapture(): Promise<void> {
-  return invoke("stop_capture");
+export async function stopCapture(): Promise<CaptureShutdownResult> {
+  return invoke<CaptureShutdownResult>("stop_capture");
 }
 
 export async function getAudioLevel(): Promise<string> {

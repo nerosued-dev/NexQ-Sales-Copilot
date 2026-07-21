@@ -49,6 +49,10 @@ export interface TranscriptSegment {
   confidence: number;
 }
 
+export interface CaptureShutdownResult {
+  segments: TranscriptSegment[];
+}
+
 export type Speaker = "User" | "Interviewer" | "Them" | "Unknown";
 
 // == MEETING TYPES ==
