@@ -9,6 +9,7 @@ pub mod word_diff;
 pub mod azure_speech;
 pub mod groq_whisper;
 mod groq_response;
+pub mod local_voice_gate;
 pub mod whisper_api;
 // STT Engine Overhaul: New streaming providers
 pub mod sherpa_sidecar;
