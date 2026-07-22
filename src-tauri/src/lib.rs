@@ -12,6 +12,9 @@ pub mod stt;
 pub mod translation;
 pub mod tray;
 
+#[cfg(all(test, target_os = "windows"))]
+mod windows_test_manifest_link;
+
 use state::AppState;
 use std::sync::{Arc, Mutex};
 use tauri::{
