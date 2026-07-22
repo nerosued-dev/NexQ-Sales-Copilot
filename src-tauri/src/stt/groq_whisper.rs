@@ -55,6 +55,11 @@ macro_rules! transcript_diag {
 /// Sample rate expected by the audio pipeline (16 kHz mono).
 const SAMPLE_RATE: u32 = 16000;
 const GROQ_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+/// Six default five-second mono PCM batches retain roughly 960 KiB per provider.
+/// A bounded queue prevents an extended Groq outage from growing memory without limit.
+/// Waiting for queue capacity deliberately applies backpressure to the audio pipeline;
+/// callers must surface that stall rather than silently dropping a completed batch.
+const GROQ_BATCH_QUEUE_CAPACITY: usize = 6;
 
 /// RMS threshold for i16 PCM silence detection.
 /// Segments with RMS below this are considered silence and skipped.
@@ -107,6 +112,7 @@ impl Default for GroqConfig {
 /// Messages sent to the utterance accumulator task.
 /// The accumulator tracks speech/silence boundaries to produce
 /// pause-based newlines (like Deepgram's endpointing).
+#[derive(Debug)]
 enum AccumulatorMsg {
     /// A batch returned speech text — append to current utterance.
     Speech {
@@ -120,13 +126,65 @@ enum AccumulatorMsg {
     Flush,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GroqRequestType {
+    Normal,
+    Residual,
+}
+
+impl GroqRequestType {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::Residual => "residual",
+        }
+    }
+}
+
+struct GroqBatchJob {
+    sequence: u64,
+    samples: Vec<i16>,
+    config: GroqConfig,
+    request_type: GroqRequestType,
+    timestamp_ms: u64,
+    audio_duration_secs: f32,
+    rms: f64,
+}
+
 struct TranscriptionRequestContext<'a> {
     party: &'a str,
-    request_id: u64,
+    sequence: u64,
     request_type: &'a str,
     audio_duration_secs: f32,
     rms: f64,
     app_handle: Option<&'a AppHandle>,
+}
+
+#[async_trait]
+trait GroqBatchProcessor: Send + Sync {
+    async fn transcribe(
+        &self,
+        sequence: u64,
+        samples: Vec<i16>,
+        config: GroqConfig,
+    ) -> Result<NormalizedGroqTranscription, String>;
+}
+
+struct HttpGroqBatchProcessor {
+    api_key: String,
+    app_handle: Option<AppHandle>,
+}
+
+#[async_trait]
+impl GroqBatchProcessor for HttpGroqBatchProcessor {
+    async fn transcribe(
+        &self,
+        _sequence: u64,
+        samples: Vec<i16>,
+        config: GroqConfig,
+    ) -> Result<NormalizedGroqTranscription, String> {
+        GroqWhisperSTT::call_api(&self.api_key, &config, samples, self.app_handle.as_ref()).await
+    }
 }
 
 // ── GroqWhisperSTT provider ──
@@ -166,10 +224,14 @@ pub struct GroqWhisperSTT {
     /// Channel to send results to the utterance accumulator task.
     accumulator_tx: Option<mpsc::Sender<AccumulatorMsg>>,
     accumulator_task: Option<JoinHandle<()>>,
-    request_tasks: Vec<JoinHandle<Result<(), String>>>,
-    /// Debug-only sequence source for correlating request lifecycle logs.
-    /// It is never persisted, emitted, or read by functional logic.
-    diag_request_counter: u64,
+    /// Bounded FIFO owned by this provider instance. A separate provider has a
+    /// separate queue and worker, so You and Them can call Groq concurrently.
+    batch_tx: Option<mpsc::Sender<GroqBatchJob>>,
+    batch_worker_task: Option<JoinHandle<Result<(), String>>>,
+    /// Diagnostic-only sequence assigned as each batch enters this provider's queue.
+    /// It is never persisted or emitted to the frontend.
+    next_batch_sequence: u64,
+    batch_processor_override: Option<Arc<dyn GroqBatchProcessor>>,
 }
 
 impl GroqWhisperSTT {
@@ -190,8 +252,10 @@ impl GroqWhisperSTT {
             party: String::new(),
             accumulator_tx: None,
             accumulator_task: None,
-            request_tasks: Vec::new(),
-            diag_request_counter: 0,
+            batch_tx: None,
+            batch_worker_task: None,
+            next_batch_sequence: 0,
+            batch_processor_override: None,
         }
     }
 
@@ -244,6 +308,43 @@ impl GroqWhisperSTT {
         self.config.clone()
     }
 
+    async fn enqueue_batch(
+        &mut self,
+        mut job: GroqBatchJob,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let tx = self
+            .batch_tx
+            .as_ref()
+            .cloned()
+            .ok_or("Groq batch worker is not running")?;
+
+        // Reserving a bounded slot is the explicit backpressure point. Sequence
+        // assignment happens only after the slot is available, immediately before
+        // the job enters this provider's FIFO.
+        let permit = tx
+            .reserve()
+            .await
+            .map_err(|_| "Groq batch worker stopped accepting jobs")?;
+        let sequence = self
+            .next_batch_sequence
+            .checked_add(1)
+            .ok_or("Groq batch sequence exhausted")?;
+        self.next_batch_sequence = sequence;
+        job.sequence = sequence;
+
+        transcript_diag!(
+            "event=batch_enqueued sequence={} party={} requestType={} audioDurationSecs={:.3} rms={:.1} queueCapacity={}",
+            job.sequence,
+            self.party,
+            job.request_type.as_str(),
+            job.audio_duration_secs,
+            job.rms,
+            GROQ_BATCH_QUEUE_CAPACITY
+        );
+        permit.send(job);
+        Ok(())
+    }
+
     /// Emit a debug event to both log and frontend DevLog.
     fn emit_debug(&self, level: &str, msg: &str) {
         match level {
@@ -261,10 +362,7 @@ impl GroqWhisperSTT {
         if samples.is_empty() {
             return 0.0;
         }
-        let sum_sq: f64 = samples
-            .iter()
-            .map(|&s| (s as f64) * (s as f64))
-            .sum();
+        let sum_sq: f64 = samples.iter().map(|&s| (s as f64) * (s as f64)).sum();
         (sum_sq / samples.len() as f64).sqrt()
     }
 
@@ -433,8 +531,8 @@ impl GroqWhisperSTT {
             .map(|value| value.as_str())
             .unwrap_or("none");
         transcript_diag!(
-            "event=response_decision requestId={} party={} requestType={} audioDurationSecs={:.3} rms={:.1} segmentCount={} avgLogprobPresent={} avgLogprob={:?} noSpeechProbPresent={} noSpeechProb={:?} compressionRatioPresent={} compressionRatio={:?} timestampsPresent={} decision={} reason={}",
-            context.request_id,
+            "event=response_decision sequence={} party={} requestType={} audioDurationSecs={:.3} rms={:.1} segmentCount={} avgLogprobPresent={} avgLogprob={:?} noSpeechProbPresent={} noSpeechProb={:?} compressionRatioPresent={} compressionRatio={:?} timestampsPresent={} decision={} reason={}",
+            context.sequence,
             context.party,
             context.request_type,
             context.audio_duration_secs,
@@ -474,6 +572,110 @@ impl GroqWhisperSTT {
             }
         }
     }
+
+    async fn run_batch_worker(
+        mut batch_rx: mpsc::Receiver<GroqBatchJob>,
+        processor: Arc<dyn GroqBatchProcessor>,
+        accumulator_tx: mpsc::Sender<AccumulatorMsg>,
+        party: String,
+        app_handle: Option<AppHandle>,
+    ) -> Result<(), String> {
+        let mut first_error = None;
+
+        while let Some(job) = batch_rx.recv().await {
+            let GroqBatchJob {
+                sequence,
+                samples,
+                config,
+                request_type,
+                timestamp_ms,
+                audio_duration_secs,
+                rms,
+            } = job;
+            let request_type_name = request_type.as_str();
+
+            transcript_diag!(
+                "event=request_started sequence={} party={} requestType={} audioDurationSecs={:.3} rms={:.1}",
+                sequence,
+                party,
+                request_type_name,
+                audio_duration_secs,
+                rms
+            );
+
+            // Locally silent normal batches still traverse the worker so their
+            // accumulator boundary cannot overtake an earlier HTTP response.
+            if rms < SILENCE_RMS_THRESHOLD {
+                let _ = accumulator_tx.send(AccumulatorMsg::Silence).await;
+                transcript_diag!(
+                    "event=request_completed sequence={} party={} requestType={} outcome=local_silence",
+                    sequence,
+                    party,
+                    request_type_name
+                );
+                continue;
+            }
+
+            let result = processor.transcribe(sequence, samples, config).await;
+            transcript_diag!(
+                "event=request_completed sequence={} party={} requestType={} outcome={}",
+                sequence,
+                party,
+                request_type_name,
+                if result.is_ok() { "result" } else { "failed" }
+            );
+
+            match result {
+                Ok(transcription) => {
+                    Self::forward_transcription(
+                        transcription,
+                        &accumulator_tx,
+                        timestamp_ms,
+                        TranscriptionRequestContext {
+                            party: &party,
+                            sequence,
+                            request_type: request_type_name,
+                            audio_duration_secs,
+                            rms,
+                            app_handle: app_handle.as_ref(),
+                        },
+                    )
+                    .await;
+                }
+                Err(error) => {
+                    // Preserve the prior normal-request behavior: an API failure
+                    // acts as a pause boundary. Residual failures produced no
+                    // accumulator message and continue to do so.
+                    if request_type == GroqRequestType::Normal {
+                        let _ = accumulator_tx.send(AccumulatorMsg::Silence).await;
+                    }
+                    log::warn!(
+                        "GroqWhisperSTT[{}]: batch {} ({}) failed",
+                        party,
+                        sequence,
+                        request_type_name
+                    );
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                }
+            }
+        }
+
+        transcript_diag!(
+            "event=batch_worker_drained party={} outcome={}",
+            party,
+            if first_error.is_some() {
+                "completed_with_error"
+            } else {
+                "completed"
+            }
+        );
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
 }
 
 #[async_trait]
@@ -511,7 +713,7 @@ impl STTProvider for GroqWhisperSTT {
         // Set up the utterance accumulator — manages pause-based newlines.
         // Speech batches accumulate into one line; silence triggers finalization (new line).
         let (acc_tx, mut acc_rx) = mpsc::channel::<AccumulatorMsg>(64);
-        self.accumulator_tx = Some(acc_tx);
+        self.accumulator_tx = Some(acc_tx.clone());
         self.result_tx = Some(result_tx.clone());
 
         let app_handle = self.app_handle.clone();
@@ -650,14 +852,30 @@ impl STTProvider for GroqWhisperSTT {
             }
         }));
 
+        let processor: Arc<dyn GroqBatchProcessor> =
+            self.batch_processor_override.clone().unwrap_or_else(|| {
+                Arc::new(HttpGroqBatchProcessor {
+                    api_key: self.api_key.clone(),
+                    app_handle: self.app_handle.clone(),
+                })
+            });
+        let (batch_tx, batch_rx) = mpsc::channel(GROQ_BATCH_QUEUE_CAPACITY);
+        self.batch_tx = Some(batch_tx);
+        self.batch_worker_task = Some(tokio::spawn(Self::run_batch_worker(
+            batch_rx,
+            processor,
+            acc_tx,
+            self.party.clone(),
+            self.app_handle.clone(),
+        )));
+
         self.is_streaming = true;
         self.stop_flag.store(false, Ordering::SeqCst);
         self.start_time = Some(Instant::now());
         self.audio_buffer.clear();
         self.segment_counter = 0;
         self.chunks_fed = 0;
-        self.diag_request_counter = 0;
-        self.request_tasks.clear();
+        self.next_batch_sequence = 0;
 
         self.emit_debug("info", "Stream started — accumulating audio for batch send");
         Ok(())
@@ -710,19 +928,25 @@ impl STTProvider for GroqWhisperSTT {
         // now instead of waiting for the full segment_duration.
         let pause_samples = (SAMPLE_RATE as usize) * 2; // 2 seconds
         let min_speech = (SAMPLE_RATE as usize) / 2; // 0.5 seconds minimum
-        let speech_len = self.audio_buffer.len().saturating_sub(self.trailing_silence_samples);
+        let speech_len = self
+            .audio_buffer
+            .len()
+            .saturating_sub(self.trailing_silence_samples);
 
-        let should_send = if self.trailing_silence_samples >= pause_samples && speech_len >= min_speech {
-            true // Pause detected — send speech portion
-        } else {
-            self.audio_buffer.len() >= threshold // Normal: buffer full
-        };
+        let should_send =
+            if self.trailing_silence_samples >= pause_samples && speech_len >= min_speech {
+                true // Pause detected — send speech portion
+            } else {
+                self.audio_buffer.len() >= threshold // Normal: buffer full
+            };
 
         if should_send {
             self.segment_counter += 1;
             // Trim trailing silence from the segment to send cleaner audio
             let full_buffer = std::mem::take(&mut self.audio_buffer);
-            let segment = if self.trailing_silence_samples > 0 && self.trailing_silence_samples < full_buffer.len() {
+            let segment = if self.trailing_silence_samples > 0
+                && self.trailing_silence_samples < full_buffer.len()
+            {
                 full_buffer[..full_buffer.len() - self.trailing_silence_samples].to_vec()
             } else {
                 full_buffer
@@ -736,84 +960,38 @@ impl STTProvider for GroqWhisperSTT {
             // Silence detection on the full segment
             let rms = Self::segment_rms(&segment);
 
-            if rms < SILENCE_RMS_THRESHOLD {
+            let audio_duration_secs = segment.len() as f32 / SAMPLE_RATE as f32;
+            let samples = if rms < SILENCE_RMS_THRESHOLD {
                 self.emit_debug(
                     "info",
                     &format!(
-                        "Silent segment #{} (rms={:.1}), skipping API call",
+                        "Silent segment #{} (rms={:.1}), queueing pause boundary",
                         self.segment_counter, rms
                     ),
                 );
-                if let Some(ref tx) = self.accumulator_tx {
-                    let _ = tx.send(AccumulatorMsg::Silence).await;
-                }
-                return Ok(());
-            }
-
-            self.emit_debug(
-                "info",
-                &format!(
-                    "Speech segment #{} (rms={:.1}), sending {:.1}s to API",
-                    self.segment_counter,
-                    rms,
-                    segment.len() as f32 / SAMPLE_RATE as f32
-                ),
-            );
-
-            // Spawn the API call — result flows to the accumulator
-            let api_key = self.api_key.clone();
-            let acc_tx = self.accumulator_tx.as_ref().unwrap().clone();
-            let app_handle = self.app_handle.clone();
-            self.diag_request_counter += 1;
-            let request_id = self.diag_request_counter;
-            let request_party = self.party.clone();
-            let audio_duration_secs = segment.len() as f32 / SAMPLE_RATE as f32;
-
-            let request_task = tokio::spawn(async move {
-                transcript_diag!(
-                    "event=request_started requestId={} party={} requestType=normal audioDurationSecs={:.3}",
-                    request_id,
-                    request_party,
-                    audio_duration_secs
+                // The worker only needs timing/RMS metadata for local silence.
+                Vec::new()
+            } else {
+                self.emit_debug(
+                    "info",
+                    &format!(
+                        "Speech segment #{} (rms={:.1}), queueing {:.1}s for API",
+                        self.segment_counter, rms, audio_duration_secs
+                    ),
                 );
-                let text =
-                    Self::call_api(&api_key, &config, segment, app_handle.as_ref()).await;
-                transcript_diag!(
-                    "event=request_completed requestId={} party={} requestType=normal outcome={}",
-                    request_id,
-                    request_party,
-                    if text.is_ok() {
-                        "result"
-                    } else {
-                        "failed"
-                    }
-                );
+                segment
+            };
 
-                match text {
-                    Ok(transcription) => {
-                        Self::forward_transcription(
-                            transcription,
-                            &acc_tx,
-                            timestamp_ms,
-                            TranscriptionRequestContext {
-                                party: &request_party,
-                                request_id,
-                                request_type: "normal",
-                                audio_duration_secs,
-                                rms,
-                                app_handle: app_handle.as_ref(),
-                            },
-                        )
-                        .await;
-                    }
-                    Err(error) => {
-                        let _ = acc_tx.send(AccumulatorMsg::Silence).await;
-                        return Err(error);
-                    }
-                }
-                Ok(())
-            });
-            self.request_tasks.push(request_task);
+            self.enqueue_batch(GroqBatchJob {
+                sequence: 0,
+                samples,
+                config,
+                request_type: GroqRequestType::Normal,
+                timestamp_ms,
+                audio_duration_secs,
+                rms,
+            })
+            .await?;
         }
 
         Ok(())
@@ -835,16 +1013,6 @@ impl STTProvider for GroqWhisperSTT {
         self.stop_flag.store(true, Ordering::SeqCst);
 
         let mut first_error = None;
-        for task in self.request_tasks.drain(..) {
-            let error = match task.await {
-                Ok(Ok(())) => None,
-                Ok(Err(error)) => Some(error),
-                Err(_) => Some("Groq transcription task terminated unexpectedly".to_string()),
-            };
-            if first_error.is_none() {
-                first_error = error;
-            }
-        }
 
         // Flush remaining audio buffer (if at least 0.5s of audio)
         let min_flush_samples = (SAMPLE_RATE as f32 * 0.5) as usize;
@@ -868,69 +1036,46 @@ impl STTProvider for GroqWhisperSTT {
                     .map(|t| t.elapsed().as_millis() as u64)
                     .unwrap_or(0);
                 let config = self.current_config();
-                self.diag_request_counter += 1;
-                let request_id = self.diag_request_counter;
                 let audio_duration_secs = segment.len() as f32 / SAMPLE_RATE as f32;
-                transcript_diag!(
-                    "event=request_started requestId={} party={} requestType=residual audioDurationSecs={:.3}",
-                    request_id,
-                    self.party,
-                    audio_duration_secs
-                );
-
-                // Send final segment synchronously (awaited in stop_stream)
-                let text = Self::call_api(
-                    &self.api_key,
-                    &config,
-                    segment,
-                    self.app_handle.as_ref(),
-                )
-                .await;
-                transcript_diag!(
-                    "event=request_completed requestId={} party={} requestType=residual outcome={}",
-                    request_id,
-                    self.party,
-                    if text.is_ok() {
-                        "result"
-                    } else {
-                        "failed"
-                    }
-                );
-
-                match text {
-                    Ok(transcription) => {
-                        if let Some(ref tx) = self.accumulator_tx {
-                            Self::forward_transcription(
-                                transcription,
-                                tx,
-                                timestamp_ms,
-                                TranscriptionRequestContext {
-                                    party: &self.party,
-                                    request_id,
-                                    request_type: "residual",
-                                    audio_duration_secs,
-                                    rms,
-                                    app_handle: self.app_handle.as_ref(),
-                                },
-                            )
-                            .await;
-                        }
-                    }
-                    Err(error) => {
-                        if first_error.is_none() {
-                            first_error = Some(error);
-                        }
-                    }
+                if let Err(error) = self
+                    .enqueue_batch(GroqBatchJob {
+                        sequence: 0,
+                        samples: segment,
+                        config,
+                        request_type: GroqRequestType::Residual,
+                        timestamp_ms,
+                        audio_duration_secs,
+                        rms,
+                    })
+                    .await
+                {
+                    first_error = Some(error.to_string());
                 }
             }
+        }
+
+        // Closing the only producer lets the per-provider worker drain every
+        // normal batch followed by the optional residual. No worker is detached.
+        self.batch_tx = None;
+        if let Some(task) = self.batch_worker_task.take() {
+            let worker_error = match task.await {
+                Ok(Ok(())) => None,
+                Ok(Err(error)) => Some(error),
+                Err(_) => Some("Groq batch worker terminated unexpectedly".to_string()),
+            };
+            if first_error.is_none() {
+                first_error = worker_error;
+            }
+        } else if first_error.is_none() {
+            first_error = Some("Groq batch worker was unavailable during shutdown".to_string());
         }
 
         // Flush the accumulator (finalize any accumulated utterance)
         if let Some(ref tx) = self.accumulator_tx {
             transcript_diag!(
-                "event=accumulator_flush_sent party={} requestCount={}",
+                "event=accumulator_flush_sent party={} batchCount={}",
                 self.party,
-                self.diag_request_counter
+                self.next_batch_sequence
             );
             let _ = tx.send(AccumulatorMsg::Flush).await;
         }
@@ -939,10 +1084,12 @@ impl STTProvider for GroqWhisperSTT {
         self.accumulator_tx = None;
         if let Some(task) = self.accumulator_task.take() {
             if task.await.is_err() && first_error.is_none() {
-                first_error = Some("Groq transcript accumulator terminated unexpectedly".to_string());
+                first_error =
+                    Some("Groq transcript accumulator terminated unexpectedly".to_string());
             }
         }
         self.audio_buffer.clear();
+        self.trailing_silence_samples = 0;
         self.is_streaming = false;
         self.result_tx = None;
         self.start_time = None;
@@ -991,6 +1138,605 @@ impl STTProvider for GroqWhisperSTT {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+    use std::sync::atomic::AtomicUsize;
+    use std::time::Duration;
+    use tokio::sync::{oneshot, Mutex as AsyncMutex};
+
+    type MockOutcome = Result<NormalizedGroqTranscription, String>;
+
+    struct ControlledProcessor {
+        started_tx: mpsc::Sender<u64>,
+        releases: AsyncMutex<HashMap<u64, oneshot::Receiver<MockOutcome>>>,
+        active: AtomicUsize,
+        max_active: AtomicUsize,
+    }
+
+    impl ControlledProcessor {
+        fn observe_active(&self, current: usize) {
+            let mut observed = self.max_active.load(Ordering::SeqCst);
+            while current > observed {
+                match self.max_active.compare_exchange(
+                    observed,
+                    current,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                ) {
+                    Ok(_) => break,
+                    Err(next) => observed = next,
+                }
+            }
+        }
+    }
+
+    #[async_trait]
+    impl GroqBatchProcessor for ControlledProcessor {
+        async fn transcribe(
+            &self,
+            sequence: u64,
+            _samples: Vec<i16>,
+            _config: GroqConfig,
+        ) -> MockOutcome {
+            let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.observe_active(active);
+            if self.started_tx.send(sequence).await.is_err() {
+                self.active.fetch_sub(1, Ordering::SeqCst);
+                return Err("mock start observer closed".to_string());
+            }
+            let release = self.releases.lock().await.remove(&sequence);
+            let outcome = match release {
+                Some(release) => release
+                    .await
+                    .unwrap_or_else(|_| Err("mock release dropped".to_string())),
+                None => Err("mock release missing".to_string()),
+            };
+            self.active.fetch_sub(1, Ordering::SeqCst);
+            outcome
+        }
+    }
+
+    struct ScriptedProcessor {
+        outcomes: AsyncMutex<HashMap<u64, MockOutcome>>,
+        calls: AsyncMutex<Vec<u64>>,
+    }
+
+    #[async_trait]
+    impl GroqBatchProcessor for ScriptedProcessor {
+        async fn transcribe(
+            &self,
+            sequence: u64,
+            _samples: Vec<i16>,
+            _config: GroqConfig,
+        ) -> MockOutcome {
+            self.calls.lock().await.push(sequence);
+            self.outcomes
+                .lock()
+                .await
+                .remove(&sequence)
+                .unwrap_or_else(|| Err("mock outcome missing".to_string()))
+        }
+    }
+
+    fn transcription(text: &str) -> NormalizedGroqTranscription {
+        NormalizedGroqTranscription {
+            text: text.to_string(),
+            segment_count: 1,
+            avg_logprob: Some(-0.1),
+            no_speech_prob: Some(0.01),
+            compression_ratio: Some(1.0),
+            has_timestamps: true,
+        }
+    }
+
+    fn batch_job(sequence: u64, request_type: GroqRequestType) -> GroqBatchJob {
+        GroqBatchJob {
+            sequence,
+            samples: vec![200; 16],
+            config: GroqConfig::default(),
+            request_type,
+            timestamp_ms: sequence * 100,
+            audio_duration_secs: 0.001,
+            rms: 200.0,
+        }
+    }
+
+    fn silent_batch_job(sequence: u64) -> GroqBatchJob {
+        GroqBatchJob {
+            samples: Vec::new(),
+            rms: 0.0,
+            ..batch_job(sequence, GroqRequestType::Normal)
+        }
+    }
+
+    fn audio_chunk(samples: usize, timestamp_ms: u64) -> AudioChunk {
+        AudioChunk {
+            pcm_data: vec![200; samples],
+            source: crate::audio::AudioSource::Mic,
+            timestamp_ms,
+            is_speech: false,
+        }
+    }
+
+    fn controlled_processor(
+        sequences: &[u64],
+    ) -> (
+        Arc<ControlledProcessor>,
+        mpsc::Receiver<u64>,
+        HashMap<u64, oneshot::Sender<MockOutcome>>,
+    ) {
+        let (started_tx, started_rx) = mpsc::channel(sequences.len().max(1));
+        let mut release_receivers = HashMap::new();
+        let mut release_senders = HashMap::new();
+        for &sequence in sequences {
+            let (release_tx, release_rx) = oneshot::channel();
+            release_senders.insert(sequence, release_tx);
+            release_receivers.insert(sequence, release_rx);
+        }
+        (
+            Arc::new(ControlledProcessor {
+                started_tx,
+                releases: AsyncMutex::new(release_receivers),
+                active: AtomicUsize::new(0),
+                max_active: AtomicUsize::new(0),
+            }),
+            started_rx,
+            release_senders,
+        )
+    }
+
+    fn scripted_processor(
+        outcomes: impl IntoIterator<Item = (u64, MockOutcome)>,
+    ) -> Arc<ScriptedProcessor> {
+        Arc::new(ScriptedProcessor {
+            outcomes: AsyncMutex::new(outcomes.into_iter().collect()),
+            calls: AsyncMutex::new(Vec::new()),
+        })
+    }
+
+    fn spawn_test_worker(
+        processor: Arc<dyn GroqBatchProcessor>,
+        party: &str,
+        capacity: usize,
+    ) -> (
+        mpsc::Sender<GroqBatchJob>,
+        mpsc::Receiver<AccumulatorMsg>,
+        JoinHandle<Result<(), String>>,
+    ) {
+        let (batch_tx, batch_rx) = mpsc::channel(capacity);
+        let (accumulator_tx, accumulator_rx) = mpsc::channel(32);
+        let worker = tokio::spawn(GroqWhisperSTT::run_batch_worker(
+            batch_rx,
+            processor,
+            accumulator_tx,
+            party.to_string(),
+            None,
+        ));
+        (batch_tx, accumulator_rx, worker)
+    }
+
+    async fn receive_speech(receiver: &mut mpsc::Receiver<AccumulatorMsg>) -> String {
+        match receiver.recv().await {
+            Some(AccumulatorMsg::Speech { text, .. }) => text,
+            other => panic!("expected speech, got {other:?}"),
+        }
+    }
+
+    async fn expect_silence(receiver: &mut mpsc::Receiver<AccumulatorMsg>) {
+        assert!(matches!(
+            receiver.recv().await,
+            Some(AccumulatorMsg::Silence)
+        ));
+    }
+
+    #[tokio::test]
+    async fn worker_processes_three_batches_fifo_with_one_active_request() {
+        let (processor, mut started_rx, mut releases) = controlled_processor(&[1, 2, 3]);
+        let (batch_tx, mut accumulator_rx, worker) =
+            spawn_test_worker(processor.clone(), "You", GROQ_BATCH_QUEUE_CAPACITY);
+
+        for sequence in 1..=3 {
+            batch_tx
+                .send(batch_job(sequence, GroqRequestType::Normal))
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(started_rx.recv().await, Some(1));
+        releases
+            .remove(&2)
+            .unwrap()
+            .send(Ok(transcription("two")))
+            .unwrap();
+        tokio::task::yield_now().await;
+        assert!(started_rx.try_recv().is_err());
+        assert_eq!(processor.active.load(Ordering::SeqCst), 1);
+
+        releases
+            .remove(&1)
+            .unwrap()
+            .send(Ok(transcription("one")))
+            .unwrap();
+        assert_eq!(receive_speech(&mut accumulator_rx).await, "one");
+        assert_eq!(started_rx.recv().await, Some(2));
+        assert_eq!(receive_speech(&mut accumulator_rx).await, "two");
+        assert_eq!(started_rx.recv().await, Some(3));
+
+        releases
+            .remove(&3)
+            .unwrap()
+            .send(Ok(transcription("three")))
+            .unwrap();
+        assert_eq!(receive_speech(&mut accumulator_rx).await, "three");
+
+        drop(batch_tx);
+        assert!(worker.await.unwrap().is_ok());
+        assert_eq!(processor.max_active.load(Ordering::SeqCst), 1);
+        assert_eq!(processor.active.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn local_silence_cannot_overtake_an_active_http_batch() {
+        let (processor, mut started_rx, mut releases) = controlled_processor(&[1]);
+        let (batch_tx, mut accumulator_rx, worker) =
+            spawn_test_worker(processor, "You", GROQ_BATCH_QUEUE_CAPACITY);
+        batch_tx
+            .send(batch_job(1, GroqRequestType::Normal))
+            .await
+            .unwrap();
+        batch_tx.send(silent_batch_job(2)).await.unwrap();
+        drop(batch_tx);
+
+        assert_eq!(started_rx.recv().await, Some(1));
+        tokio::task::yield_now().await;
+        assert!(accumulator_rx.try_recv().is_err());
+        releases
+            .remove(&1)
+            .unwrap()
+            .send(Ok(transcription("first")))
+            .unwrap();
+
+        assert_eq!(receive_speech(&mut accumulator_rx).await, "first");
+        expect_silence(&mut accumulator_rx).await;
+        assert!(worker.await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn failed_batch_reports_silence_but_worker_processes_next_batch() {
+        let (processor, mut started_rx, mut releases) = controlled_processor(&[1, 2]);
+        let (batch_tx, mut accumulator_rx, worker) =
+            spawn_test_worker(processor.clone(), "You", GROQ_BATCH_QUEUE_CAPACITY);
+        batch_tx
+            .send(batch_job(1, GroqRequestType::Normal))
+            .await
+            .unwrap();
+        batch_tx
+            .send(batch_job(2, GroqRequestType::Normal))
+            .await
+            .unwrap();
+        drop(batch_tx);
+
+        assert_eq!(started_rx.recv().await, Some(1));
+        releases
+            .remove(&1)
+            .unwrap()
+            .send(Err("mock first failure".to_string()))
+            .unwrap();
+        expect_silence(&mut accumulator_rx).await;
+        assert_eq!(started_rx.recv().await, Some(2));
+        releases
+            .remove(&2)
+            .unwrap()
+            .send(Ok(transcription("second")))
+            .unwrap();
+        assert_eq!(receive_speech(&mut accumulator_rx).await, "second");
+
+        let outcome = tokio::time::timeout(Duration::from_secs(1), worker)
+            .await
+            .expect("worker deadlocked")
+            .unwrap();
+        assert_eq!(outcome.unwrap_err(), "mock first failure");
+        assert_eq!(processor.max_active.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn empty_rejected_and_local_silence_keep_existing_accumulator_behavior() {
+        let processor = scripted_processor([
+            (1, Ok(transcription(""))),
+            (2, Ok(transcription("."))),
+            (4, Ok(transcription("valid speech"))),
+        ]);
+        let (batch_tx, mut accumulator_rx, worker) =
+            spawn_test_worker(processor.clone(), "Them", GROQ_BATCH_QUEUE_CAPACITY);
+        batch_tx
+            .send(batch_job(1, GroqRequestType::Normal))
+            .await
+            .unwrap();
+        batch_tx
+            .send(batch_job(2, GroqRequestType::Normal))
+            .await
+            .unwrap();
+        batch_tx.send(silent_batch_job(3)).await.unwrap();
+        batch_tx
+            .send(batch_job(4, GroqRequestType::Normal))
+            .await
+            .unwrap();
+        drop(batch_tx);
+
+        expect_silence(&mut accumulator_rx).await;
+        expect_silence(&mut accumulator_rx).await;
+        expect_silence(&mut accumulator_rx).await;
+        assert_eq!(receive_speech(&mut accumulator_rx).await, "valid speech");
+        assert!(worker.await.unwrap().is_ok());
+        assert_eq!(*processor.calls.lock().await, vec![1, 2, 4]);
+    }
+
+    #[tokio::test]
+    async fn residual_failure_preserves_the_existing_no_silence_behavior() {
+        let processor = scripted_processor([(1, Err("residual failed".to_string()))]);
+        let (batch_tx, mut accumulator_rx, worker) =
+            spawn_test_worker(processor, "Them", GROQ_BATCH_QUEUE_CAPACITY);
+        batch_tx
+            .send(batch_job(1, GroqRequestType::Residual))
+            .await
+            .unwrap();
+        drop(batch_tx);
+
+        assert_eq!(worker.await.unwrap().unwrap_err(), "residual failed");
+        assert!(accumulator_rx.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn stop_drains_active_pending_and_residual_before_flush_and_return() {
+        let (processor, mut started_rx, mut releases) = controlled_processor(&[1, 2, 3]);
+        let mut provider = GroqWhisperSTT::with_api_key("test-key");
+        provider.set_party("You");
+        provider.set_config(GroqConfig {
+            segment_duration_secs: 1.0,
+            ..GroqConfig::default()
+        });
+        provider.batch_processor_override = Some(processor.clone());
+        let (result_tx, mut result_rx) = mpsc::channel(16);
+        provider.start_stream(result_tx).await.unwrap();
+
+        provider.feed_audio(audio_chunk(16_000, 100)).await.unwrap();
+        assert_eq!(started_rx.recv().await, Some(1));
+        provider.feed_audio(audio_chunk(16_000, 200)).await.unwrap();
+        provider.feed_audio(audio_chunk(8_000, 300)).await.unwrap();
+
+        let mut stop_task = tokio::spawn(async move {
+            let outcome = provider
+                .stop_stream()
+                .await
+                .map_err(|error| error.to_string());
+            (provider, outcome)
+        });
+        tokio::task::yield_now().await;
+        assert!(matches!(
+            futures::poll!(&mut stop_task),
+            std::task::Poll::Pending
+        ));
+
+        releases
+            .remove(&1)
+            .unwrap()
+            .send(Ok(transcription("normal one")))
+            .unwrap();
+        assert_eq!(started_rx.recv().await, Some(2));
+        releases
+            .remove(&2)
+            .unwrap()
+            .send(Ok(transcription("normal two")))
+            .unwrap();
+        assert_eq!(started_rx.recv().await, Some(3));
+        assert!(matches!(
+            futures::poll!(&mut stop_task),
+            std::task::Poll::Pending
+        ));
+
+        releases
+            .remove(&3)
+            .unwrap()
+            .send(Ok(transcription("residual")))
+            .unwrap();
+        let (mut provider, outcome) = stop_task.await.unwrap();
+        outcome.unwrap();
+
+        let mut results = Vec::new();
+        while let Some(result) = result_rx.recv().await {
+            results.push(result);
+        }
+        assert_eq!(results.len(), 4);
+        assert_eq!(results[0].text, "normal one");
+        assert_eq!(results[1].text, "normal one normal two");
+        assert_eq!(results[2].text, "normal one normal two residual");
+        assert!(!results[0].is_final);
+        assert!(!results[1].is_final);
+        assert!(!results[2].is_final);
+        assert!(results[3].is_final);
+        assert_eq!(results[3].text, results[2].text);
+        assert!(provider.batch_tx.is_none());
+        assert!(provider.batch_worker_task.is_none());
+        assert!(!provider.is_streaming);
+        assert_eq!(provider.next_batch_sequence, 3);
+        assert_eq!(processor.max_active.load(Ordering::SeqCst), 1);
+
+        provider.stop_stream().await.unwrap();
+        assert_eq!(provider.next_batch_sequence, 3);
+    }
+
+    #[tokio::test]
+    async fn stop_with_mock_error_drains_later_jobs_without_deadlock() {
+        let processor = scripted_processor([
+            (1, Err("mock network error".to_string())),
+            (2, Ok(transcription("after failure"))),
+        ]);
+        let mut provider = GroqWhisperSTT::with_api_key("test-key");
+        provider.set_config(GroqConfig {
+            segment_duration_secs: 1.0,
+            ..GroqConfig::default()
+        });
+        provider.batch_processor_override = Some(processor.clone());
+        let (result_tx, mut result_rx) = mpsc::channel(8);
+        provider.start_stream(result_tx).await.unwrap();
+        provider.feed_audio(audio_chunk(16_000, 100)).await.unwrap();
+        provider.feed_audio(audio_chunk(16_000, 200)).await.unwrap();
+
+        let error = tokio::time::timeout(Duration::from_secs(1), provider.stop_stream())
+            .await
+            .expect("stop_stream deadlocked")
+            .unwrap_err();
+        assert_eq!(error.to_string(), "mock network error");
+        assert_eq!(*processor.calls.lock().await, vec![1, 2]);
+        assert!(provider.batch_worker_task.is_none());
+
+        let partial = result_rx.recv().await.unwrap();
+        let final_result = result_rx.recv().await.unwrap();
+        assert_eq!(partial.text, "after failure");
+        assert!(!partial.is_final);
+        assert_eq!(final_result.text, "after failure");
+        assert!(final_result.is_final);
+        assert!(result_rx.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn you_and_them_workers_are_independent_with_per_provider_sequences() {
+        let (you_processor, mut you_started, mut you_releases) = controlled_processor(&[1, 2]);
+        let (them_processor, mut them_started, mut them_releases) = controlled_processor(&[1, 2]);
+        let config = GroqConfig {
+            segment_duration_secs: 1.0,
+            ..GroqConfig::default()
+        };
+
+        let mut you = GroqWhisperSTT::with_api_key("test-key");
+        you.set_party("You");
+        you.set_config(config.clone());
+        you.batch_processor_override = Some(you_processor.clone());
+        let (you_result_tx, mut you_results) = mpsc::channel(8);
+        you.start_stream(you_result_tx).await.unwrap();
+
+        let mut them = GroqWhisperSTT::with_api_key("test-key");
+        them.set_party("Them");
+        them.set_config(config);
+        them.batch_processor_override = Some(them_processor.clone());
+        let (them_result_tx, mut them_results) = mpsc::channel(8);
+        them.start_stream(them_result_tx).await.unwrap();
+
+        you.feed_audio(audio_chunk(16_000, 100)).await.unwrap();
+        you.feed_audio(audio_chunk(16_000, 200)).await.unwrap();
+        them.feed_audio(audio_chunk(16_000, 100)).await.unwrap();
+        them.feed_audio(audio_chunk(16_000, 200)).await.unwrap();
+        assert_eq!(you_started.recv().await, Some(1));
+        assert_eq!(them_started.recv().await, Some(1));
+
+        them_releases
+            .remove(&1)
+            .unwrap()
+            .send(Ok(transcription("them one")))
+            .unwrap();
+        assert_eq!(them_started.recv().await, Some(2));
+        them_releases
+            .remove(&2)
+            .unwrap()
+            .send(Ok(transcription("them two")))
+            .unwrap();
+        assert_eq!(receive_speech_result(&mut them_results).await, "them one");
+        assert_eq!(
+            receive_speech_result(&mut them_results).await,
+            "them one them two"
+        );
+        assert!(you_results.try_recv().is_err());
+        assert_eq!(you_processor.active.load(Ordering::SeqCst), 1);
+
+        you_releases
+            .remove(&1)
+            .unwrap()
+            .send(Ok(transcription("you one")))
+            .unwrap();
+        assert_eq!(you_started.recv().await, Some(2));
+        you_releases
+            .remove(&2)
+            .unwrap()
+            .send(Ok(transcription("you two")))
+            .unwrap();
+        assert_eq!(receive_speech_result(&mut you_results).await, "you one");
+        assert_eq!(
+            receive_speech_result(&mut you_results).await,
+            "you one you two"
+        );
+
+        let (you_stop, them_stop) = tokio::join!(you.stop_stream(), them.stop_stream());
+        you_stop.unwrap();
+        them_stop.unwrap();
+        assert_eq!(you.next_batch_sequence, 2);
+        assert_eq!(them.next_batch_sequence, 2);
+        assert_eq!(you_processor.max_active.load(Ordering::SeqCst), 1);
+        assert_eq!(them_processor.max_active.load(Ordering::SeqCst), 1);
+    }
+
+    async fn receive_speech_result(receiver: &mut mpsc::Receiver<TranscriptResult>) -> String {
+        receiver.recv().await.unwrap().text
+    }
+
+    #[tokio::test]
+    async fn bounded_queue_applies_backpressure_and_preserves_every_job() {
+        let (batch_tx, mut batch_rx) = mpsc::channel(GROQ_BATCH_QUEUE_CAPACITY);
+        assert_eq!(batch_tx.max_capacity(), GROQ_BATCH_QUEUE_CAPACITY);
+        for sequence in 1..=GROQ_BATCH_QUEUE_CAPACITY as u64 {
+            batch_tx
+                .send(batch_job(sequence, GroqRequestType::Normal))
+                .await
+                .unwrap();
+        }
+        assert_eq!(batch_tx.capacity(), 0);
+
+        let blocked_tx = batch_tx.clone();
+        let (attempted_tx, attempted_rx) = oneshot::channel();
+        let mut blocked_producer = tokio::spawn(async move {
+            attempted_tx.send(()).unwrap();
+            blocked_tx.send(batch_job(7, GroqRequestType::Normal)).await
+        });
+        attempted_rx.await.unwrap();
+        tokio::task::yield_now().await;
+        assert!(matches!(
+            futures::poll!(&mut blocked_producer),
+            std::task::Poll::Pending
+        ));
+
+        assert_eq!(batch_rx.recv().await.unwrap().sequence, 1);
+        blocked_producer.await.unwrap().unwrap();
+        drop(batch_tx);
+
+        let mut remaining = Vec::new();
+        while let Some(job) = batch_rx.recv().await {
+            remaining.push(job.sequence);
+        }
+        assert_eq!(remaining, vec![2, 3, 4, 5, 6, 7]);
+    }
+
+    #[tokio::test]
+    async fn closing_full_queue_releases_blocked_producer_with_its_job() {
+        let (batch_tx, batch_rx) = mpsc::channel(GROQ_BATCH_QUEUE_CAPACITY);
+        for sequence in 1..=GROQ_BATCH_QUEUE_CAPACITY as u64 {
+            batch_tx
+                .send(batch_job(sequence, GroqRequestType::Normal))
+                .await
+                .unwrap();
+        }
+
+        let blocked_tx = batch_tx.clone();
+        let (attempted_tx, attempted_rx) = oneshot::channel();
+        let blocked_producer = tokio::spawn(async move {
+            attempted_tx.send(()).unwrap();
+            blocked_tx.send(batch_job(7, GroqRequestType::Normal)).await
+        });
+        attempted_rx.await.unwrap();
+        tokio::task::yield_now().await;
+        drop(batch_rx);
+
+        let error = blocked_producer.await.unwrap().unwrap_err();
+        assert_eq!(error.0.sequence, 7);
+        drop(batch_tx);
+    }
 
     #[tokio::test]
     async fn silence_finalizes_an_open_partial_with_derived_confidence() {
@@ -1028,6 +1774,17 @@ mod tests {
         assert_eq!(final_result.confidence, 0.73);
         assert!(result_rx.try_recv().is_err());
 
-        provider.stop_stream().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), provider.stop_stream())
+            .await
+            .expect("empty worker deadlocked during stop")
+            .unwrap();
+        assert!(provider.batch_tx.is_none());
+        assert!(provider.batch_worker_task.is_none());
+
+        tokio::time::timeout(Duration::from_secs(1), provider.stop_stream())
+            .await
+            .expect("repeated stop deadlocked")
+            .unwrap();
+        assert!(result_rx.try_recv().is_err());
     }
 }
