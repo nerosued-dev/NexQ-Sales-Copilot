@@ -3,8 +3,8 @@
 // Groq provides an OpenAI-compatible transcription endpoint at:
 //   https://api.groq.com/openai/v1/audio/transcriptions
 //
-// Accumulates audio chunks into configurable-length segments (default 5s),
-// then POSTs each segment as multipart form data.
+// Gates audio locally into voice-confirmed configurable-length batches,
+// then POSTs each batch as multipart form data.
 // Uses Bearer token auth.
 //
 // Available models (March 2026):
@@ -12,7 +12,8 @@
 //   - whisper-large-v3-turbo (fast + cheap, 216x real-time, $0.04/hr)
 //
 // Key behaviors:
-//   - Silence detection: segments with RMS below threshold are skipped (no API call)
+//   - Local voice gate: only confirmed voice regions become queued batches
+//   - Secondary silence defense: ready batches with RMS below threshold skip the API call
 //   - Hallucination filter: known Whisper artifacts ("Thank you", etc.) are discarded
 //   - Pause-based newlines: speech batches accumulate into one line until silence
 //   - Live config updates: reads shared config Arc on each API call
@@ -30,6 +31,10 @@ use crate::audio::AudioChunk;
 use crate::stt::groq_response::{
     decide_transcript_acceptance, normalize_response, parse_groq_response,
     NormalizedGroqTranscription, TranscriptAcceptance,
+};
+use crate::stt::local_voice_gate::{
+    LocalVoiceGate, LocalVoiceGateConfig, ReadyBatch, VoiceBatchMetrics, VoiceGateState,
+    FRAME_DURATION_MS,
 };
 use crate::stt::provider::{STTProvider, STTProviderType, TranscriptResult};
 
@@ -141,14 +146,40 @@ impl GroqRequestType {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VoiceBatchReason {
+    MaxDuration,
+    Endpoint,
+    Finish,
+}
+
+impl VoiceBatchReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::MaxDuration => "max_duration",
+            Self::Endpoint => "endpoint",
+            Self::Finish => "finish",
+        }
+    }
+}
+
 struct GroqBatchJob {
     sequence: u64,
     samples: Vec<i16>,
     config: GroqConfig,
     request_type: GroqRequestType,
+    ends_utterance: bool,
+    gate_metrics: VoiceBatchMetrics,
+    gate_reason: VoiceBatchReason,
     timestamp_ms: u64,
     audio_duration_secs: f32,
     rms: f64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AccumulatorBatchDecision {
+    Speech,
+    Silence,
 }
 
 struct TranscriptionRequestContext<'a> {
@@ -191,8 +222,8 @@ impl GroqBatchProcessor for HttpGroqBatchProcessor {
 
 /// Groq Whisper REST API STT provider.
 ///
-/// Accumulates PCM audio into configurable-length segments and POSTs them
-/// as WAV files to the Groq /openai/v1/audio/transcriptions endpoint.
+/// Uses a local per-stream voice gate to form configurable-length PCM batches,
+/// then POSTs confirmed speech as WAV files to the Groq endpoint.
 ///
 /// Uses an utterance accumulator task to produce pause-based newlines:
 /// consecutive speech batches are joined into one line, and a silent batch
@@ -208,11 +239,9 @@ pub struct GroqWhisperSTT {
     result_tx: Option<mpsc::Sender<TranscriptResult>>,
     stop_flag: Arc<AtomicBool>,
     start_time: Option<Instant>,
-    /// Accumulated PCM samples for the current segment.
-    audio_buffer: Vec<i16>,
-    /// Number of consecutive silence samples at the tail of audio_buffer.
-    /// Used to split segments at pause boundaries before sending to API.
-    trailing_silence_samples: usize,
+    /// Per-stream acoustic gate. It is created on start and discarded on stop,
+    /// so no candidate, pre-roll, or utterance state survives between captures.
+    voice_gate: Option<LocalVoiceGate>,
     /// Segment counter for diagnostics.
     segment_counter: u64,
     /// Chunks fed since stream start (for periodic diagnostics).
@@ -244,8 +273,7 @@ impl GroqWhisperSTT {
             result_tx: None,
             stop_flag: Arc::new(AtomicBool::new(false)),
             start_time: None,
-            audio_buffer: Vec::new(),
-            trailing_silence_samples: 0,
+            voice_gate: None,
             segment_counter: 0,
             chunks_fed: 0,
             app_handle: None,
@@ -308,6 +336,52 @@ impl GroqWhisperSTT {
         self.config.clone()
     }
 
+    fn voice_gate_config(config: &GroqConfig) -> Result<LocalVoiceGateConfig, String> {
+        let requested_ms = f64::from(config.segment_duration_secs) * 1_000.0;
+        if !requested_ms.is_finite() || requested_ms <= 0.0 {
+            return Err("Groq segment duration must be finite and greater than zero".to_string());
+        }
+
+        let frame_duration_ms = f64::from(FRAME_DURATION_MS);
+        let aligned_frames = (requested_ms / frame_duration_ms).round();
+        let max_frames = f64::from(u32::MAX / FRAME_DURATION_MS);
+        if aligned_frames < 1.0 || aligned_frames > max_frames {
+            return Err("Groq segment duration is outside the local voice gate range".to_string());
+        }
+
+        let mut gate_config = LocalVoiceGateConfig::initial_test_hypothesis();
+        gate_config.max_batch_ms = aligned_frames as u32 * FRAME_DURATION_MS;
+        Ok(gate_config)
+    }
+
+    fn create_voice_gate(config: &GroqConfig) -> Result<LocalVoiceGate, String> {
+        LocalVoiceGate::new(Self::voice_gate_config(config)?)
+            .map_err(|error| format!("Local voice gate configuration failed: {error}"))
+    }
+
+    fn ready_batch_job(
+        ready_batch: ReadyBatch,
+        config: GroqConfig,
+        request_type: GroqRequestType,
+        gate_reason: VoiceBatchReason,
+        timestamp_ms: u64,
+    ) -> GroqBatchJob {
+        let rms = Self::segment_rms(&ready_batch.samples);
+        let audio_duration_secs = ready_batch.samples.len() as f32 / SAMPLE_RATE as f32;
+        GroqBatchJob {
+            sequence: 0,
+            samples: ready_batch.samples,
+            config,
+            request_type,
+            ends_utterance: ready_batch.ends_utterance,
+            gate_metrics: ready_batch.metrics,
+            gate_reason,
+            timestamp_ms,
+            audio_duration_secs,
+            rms,
+        }
+    }
+
     async fn enqueue_batch(
         &mut self,
         mut job: GroqBatchJob,
@@ -333,12 +407,18 @@ impl GroqWhisperSTT {
         job.sequence = sequence;
 
         transcript_diag!(
-            "event=batch_enqueued sequence={} party={} requestType={} audioDurationSecs={:.3} rms={:.1} queueCapacity={}",
+            "event=batch_enqueued sequence={} party={} requestType={} gateReason={} endsUtterance={} audioDurationSecs={:.3} rms={:.1} totalFrames={} positiveFrames={} positiveRatio={:.3} longestPositiveRunFrames={} queueCapacity={}",
             job.sequence,
             self.party,
             job.request_type.as_str(),
+            job.gate_reason.as_str(),
+            job.ends_utterance,
             job.audio_duration_secs,
             job.rms,
+            job.gate_metrics.total_frames,
+            job.gate_metrics.positive_frames,
+            job.gate_metrics.positive_ratio,
+            job.gate_metrics.longest_positive_run_frames,
             GROQ_BATCH_QUEUE_CAPACITY
         );
         permit.send(job);
@@ -524,7 +604,7 @@ impl GroqWhisperSTT {
         accumulator_tx: &mpsc::Sender<AccumulatorMsg>,
         timestamp_ms: u64,
         context: TranscriptionRequestContext<'_>,
-    ) {
+    ) -> AccumulatorBatchDecision {
         let acceptance = decide_transcript_acceptance(&transcription);
         let reason = acceptance
             .reason()
@@ -558,6 +638,7 @@ impl GroqWhisperSTT {
                         timestamp_ms,
                     })
                     .await;
+                AccumulatorBatchDecision::Speech
             }
             TranscriptAcceptance::Silence { .. } | TranscriptAcceptance::Rejected { .. } => {
                 if let Some(handle) = context.app_handle {
@@ -569,6 +650,7 @@ impl GroqWhisperSTT {
                     );
                 }
                 let _ = accumulator_tx.send(AccumulatorMsg::Silence).await;
+                AccumulatorBatchDecision::Silence
             }
         }
     }
@@ -588,6 +670,9 @@ impl GroqWhisperSTT {
                 samples,
                 config,
                 request_type,
+                ends_utterance,
+                gate_metrics,
+                gate_reason,
                 timestamp_ms,
                 audio_duration_secs,
                 rms,
@@ -595,23 +680,31 @@ impl GroqWhisperSTT {
             let request_type_name = request_type.as_str();
 
             transcript_diag!(
-                "event=request_started sequence={} party={} requestType={} audioDurationSecs={:.3} rms={:.1}",
+                "event=request_started sequence={} party={} requestType={} gateReason={} endsUtterance={} audioDurationSecs={:.3} rms={:.1} totalFrames={} positiveFrames={} positiveRatio={:.3}",
                 sequence,
                 party,
                 request_type_name,
+                gate_reason.as_str(),
+                ends_utterance,
                 audio_duration_secs,
-                rms
+                rms,
+                gate_metrics.total_frames,
+                gate_metrics.positive_frames,
+                gate_metrics.positive_ratio
             );
 
-            // Locally silent normal batches still traverse the worker so their
-            // accumulator boundary cannot overtake an earlier HTTP response.
+            // Every gate-approved batch still crosses the secondary RMS defense
+            // inside the ordered worker. Its silence decision therefore cannot
+            // overtake an earlier HTTP response.
             if rms < SILENCE_RMS_THRESHOLD {
                 let _ = accumulator_tx.send(AccumulatorMsg::Silence).await;
                 transcript_diag!(
-                    "event=request_completed sequence={} party={} requestType={} outcome=local_silence",
+                    "event=request_completed sequence={} party={} requestType={} gateReason={} endsUtterance={} outcome=local_silence",
                     sequence,
                     party,
-                    request_type_name
+                    request_type_name,
+                    gate_reason.as_str(),
+                    ends_utterance
                 );
                 continue;
             }
@@ -627,7 +720,7 @@ impl GroqWhisperSTT {
 
             match result {
                 Ok(transcription) => {
-                    Self::forward_transcription(
+                    let decision = Self::forward_transcription(
                         transcription,
                         &accumulator_tx,
                         timestamp_ms,
@@ -641,12 +734,22 @@ impl GroqWhisperSTT {
                         },
                     )
                     .await;
+                    if ends_utterance && decision == AccumulatorBatchDecision::Speech {
+                        let _ = accumulator_tx.send(AccumulatorMsg::Silence).await;
+                        transcript_diag!(
+                            "event=utterance_boundary_applied sequence={} party={} requestType={} gateReason={} after=speech",
+                            sequence,
+                            party,
+                            request_type_name,
+                            gate_reason.as_str()
+                        );
+                    }
                 }
                 Err(error) => {
                     // Preserve the prior normal-request behavior: an API failure
-                    // acts as a pause boundary. Residual failures produced no
-                    // accumulator message and continue to do so.
-                    if request_type == GroqRequestType::Normal {
+                    // acts as a pause boundary. A final residual failure also
+                    // closes the gate-confirmed utterance so it cannot remain open.
+                    if request_type == GroqRequestType::Normal || ends_utterance {
                         let _ = accumulator_tx.send(AccumulatorMsg::Silence).await;
                     }
                     log::warn!(
@@ -702,6 +805,8 @@ impl STTProvider for GroqWhisperSTT {
         }
 
         let config = self.current_config();
+        let gate_config = Self::voice_gate_config(&config)?;
+        let voice_gate = Self::create_voice_gate(&config)?;
         self.emit_debug(
             "info",
             &format!(
@@ -872,12 +977,20 @@ impl STTProvider for GroqWhisperSTT {
         self.is_streaming = true;
         self.stop_flag.store(false, Ordering::SeqCst);
         self.start_time = Some(Instant::now());
-        self.audio_buffer.clear();
+        self.voice_gate = Some(voice_gate);
         self.segment_counter = 0;
         self.chunks_fed = 0;
         self.next_batch_sequence = 0;
 
-        self.emit_debug("info", "Stream started — accumulating audio for batch send");
+        transcript_diag!(
+            "event=voice_gate_created party={} state=idle maxBatchMs={} hypothesis=initial_test",
+            self.party,
+            gate_config.max_batch_ms
+        );
+        self.emit_debug(
+            "info",
+            "Stream started: local voice gate is selecting Groq batches",
+        );
         Ok(())
     }
 
@@ -896,102 +1009,85 @@ impl STTProvider for GroqWhisperSTT {
             self.emit_debug("info", "First audio chunk received");
         }
         if self.chunks_fed % 500 == 0 {
-            let config = self.current_config();
-            let buf_secs = self.audio_buffer.len() as f32 / SAMPLE_RATE as f32;
-            self.emit_debug(
-                "info",
-                &format!(
-                    "Buffer: {:.1}s / {:.1}s ({} chunks fed)",
-                    buf_secs, config.segment_duration_secs, self.chunks_fed
-                ),
+            if let Some(gate) = self.voice_gate.as_ref() {
+                self.emit_debug(
+                    "info",
+                    &format!(
+                        "Voice gate: state={:?}, pendingSamples={}, chunksFed={}",
+                        gate.state(),
+                        gate.remainder_len(),
+                        self.chunks_fed
+                    ),
+                );
+            }
+        }
+
+        let received_samples = chunk.pcm_data.len();
+        let (previous_state, new_state, pending_samples, ready_batches) = {
+            let gate = self
+                .voice_gate
+                .as_mut()
+                .ok_or("Local voice gate is not initialized")?;
+            let previous_state = gate.state();
+            let ready_batches = gate.push_samples(&chunk.pcm_data);
+            (
+                previous_state,
+                gate.state(),
+                gate.remainder_len(),
+                ready_batches,
+            )
+        };
+
+        if previous_state != new_state {
+            let reason = match (previous_state, new_state) {
+                (VoiceGateState::Idle, VoiceGateState::Candidate) => "candidate_started",
+                (VoiceGateState::Candidate, VoiceGateState::Active) => "activation",
+                (VoiceGateState::Active, VoiceGateState::Hangover) => "hangover",
+                (VoiceGateState::Hangover, VoiceGateState::Active) => "resumption",
+                (_, VoiceGateState::Idle) => "endpoint_or_rejection",
+                _ => "state_transition",
+            };
+            transcript_diag!(
+                "event=voice_gate_transition party={} previousState={:?} newState={:?} receivedSamples={} pendingSamples={} reason={}",
+                self.party,
+                previous_state,
+                new_state,
+                received_samples,
+                pending_samples,
+                reason
             );
         }
 
-        // Track trailing silence for pause-based splitting.
-        // If this chunk is mostly silence, add its length to the counter;
-        // otherwise reset to 0 (speech resumed).
-        let chunk_rms = Self::segment_rms(&chunk.pcm_data);
-        if chunk_rms < SILENCE_RMS_THRESHOLD {
-            self.trailing_silence_samples += chunk.pcm_data.len();
-        } else {
-            self.trailing_silence_samples = 0;
-        }
-
-        self.audio_buffer.extend_from_slice(&chunk.pcm_data);
-
-        // Dynamic threshold from current config (picks up live setting changes)
-        let config = self.current_config();
-        let threshold = (SAMPLE_RATE as f32 * config.segment_duration_secs) as usize;
-
-        // Pause-based split: if we've accumulated at least 0.5s of speech
-        // AND trailing silence exceeds 2 seconds, send the speech portion
-        // now instead of waiting for the full segment_duration.
-        let pause_samples = (SAMPLE_RATE as usize) * 2; // 2 seconds
-        let min_speech = (SAMPLE_RATE as usize) / 2; // 0.5 seconds minimum
-        let speech_len = self
-            .audio_buffer
-            .len()
-            .saturating_sub(self.trailing_silence_samples);
-
-        let should_send =
-            if self.trailing_silence_samples >= pause_samples && speech_len >= min_speech {
-                true // Pause detected — send speech portion
-            } else {
-                self.audio_buffer.len() >= threshold // Normal: buffer full
-            };
-
-        if should_send {
+        let timestamp_ms = self
+            .start_time
+            .map(|start| start.elapsed().as_millis() as u64)
+            .unwrap_or(chunk.timestamp_ms);
+        for ready_batch in ready_batches {
             self.segment_counter += 1;
-            // Trim trailing silence from the segment to send cleaner audio
-            let full_buffer = std::mem::take(&mut self.audio_buffer);
-            let segment = if self.trailing_silence_samples > 0
-                && self.trailing_silence_samples < full_buffer.len()
-            {
-                full_buffer[..full_buffer.len() - self.trailing_silence_samples].to_vec()
+            let gate_reason = if ready_batch.ends_utterance {
+                VoiceBatchReason::Endpoint
             } else {
-                full_buffer
+                VoiceBatchReason::MaxDuration
             };
-            self.trailing_silence_samples = 0;
-            let timestamp_ms = self
-                .start_time
-                .map(|t| t.elapsed().as_millis() as u64)
-                .unwrap_or(chunk.timestamp_ms);
-
-            // Silence detection on the full segment
-            let rms = Self::segment_rms(&segment);
-
-            let audio_duration_secs = segment.len() as f32 / SAMPLE_RATE as f32;
-            let samples = if rms < SILENCE_RMS_THRESHOLD {
-                self.emit_debug(
-                    "info",
-                    &format!(
-                        "Silent segment #{} (rms={:.1}), queueing pause boundary",
-                        self.segment_counter, rms
-                    ),
-                );
-                // The worker only needs timing/RMS metadata for local silence.
-                Vec::new()
-            } else {
-                self.emit_debug(
-                    "info",
-                    &format!(
-                        "Speech segment #{} (rms={:.1}), queueing {:.1}s for API",
-                        self.segment_counter, rms, audio_duration_secs
-                    ),
-                );
-                segment
-            };
-
-            self.enqueue_batch(GroqBatchJob {
-                sequence: 0,
-                samples,
-                config,
-                request_type: GroqRequestType::Normal,
+            let job = Self::ready_batch_job(
+                ready_batch,
+                self.current_config(),
+                GroqRequestType::Normal,
+                gate_reason,
                 timestamp_ms,
-                audio_duration_secs,
-                rms,
-            })
-            .await?;
+            );
+            self.emit_debug(
+                "info",
+                &format!(
+                    "Voice batch #{}: reason={}, duration={:.3}s, endsUtterance={}, rms={:.1}",
+                    self.segment_counter,
+                    gate_reason.as_str(),
+                    job.audio_duration_secs,
+                    job.ends_utterance,
+                    job.rms
+                ),
+            );
+            self.enqueue_batch(job).await?;
         }
 
         Ok(())
@@ -1014,41 +1110,58 @@ impl STTProvider for GroqWhisperSTT {
 
         let mut first_error = None;
 
-        // Flush remaining audio buffer (if at least 0.5s of audio)
-        let min_flush_samples = (SAMPLE_RATE as f32 * 0.5) as usize;
-        if self.audio_buffer.len() >= min_flush_samples {
-            let segment = std::mem::take(&mut self.audio_buffer);
-            let rms = Self::segment_rms(&segment);
-
-            if rms >= SILENCE_RMS_THRESHOLD {
-                self.segment_counter += 1;
-                self.emit_debug(
-                    "info",
-                    &format!(
-                        "Flushing final {:.1}s buffer (rms={:.1})",
-                        segment.len() as f32 / SAMPLE_RATE as f32,
-                        rms
-                    ),
+        // Finalize the same gate that accepted every stream sample. Confirmed
+        // speech residuals are queued regardless of duration; candidates that
+        // never activated are discarded by LocalVoiceGate::finish.
+        let final_batches = match self.voice_gate.take() {
+            Some(mut gate) => {
+                let previous_state = gate.state();
+                let batches = gate.finish();
+                transcript_diag!(
+                    "event=voice_gate_finished party={} previousState={:?} newState={:?} batchesProduced={}",
+                    self.party,
+                    previous_state,
+                    gate.state(),
+                    batches.len()
                 );
-
-                let timestamp_ms = self
-                    .start_time
-                    .map(|t| t.elapsed().as_millis() as u64)
-                    .unwrap_or(0);
-                let config = self.current_config();
-                let audio_duration_secs = segment.len() as f32 / SAMPLE_RATE as f32;
-                if let Err(error) = self
-                    .enqueue_batch(GroqBatchJob {
-                        sequence: 0,
-                        samples: segment,
-                        config,
-                        request_type: GroqRequestType::Residual,
-                        timestamp_ms,
-                        audio_duration_secs,
-                        rms,
-                    })
-                    .await
-                {
+                batches
+            }
+            None => {
+                first_error = Some("Local voice gate was unavailable during shutdown".to_string());
+                Vec::new()
+            }
+        };
+        let timestamp_ms = self
+            .start_time
+            .map(|start| start.elapsed().as_millis() as u64)
+            .unwrap_or(0);
+        for ready_batch in final_batches {
+            self.segment_counter += 1;
+            let gate_reason = if ready_batch.ends_utterance {
+                VoiceBatchReason::Finish
+            } else {
+                VoiceBatchReason::MaxDuration
+            };
+            let job = Self::ready_batch_job(
+                ready_batch,
+                self.current_config(),
+                GroqRequestType::Residual,
+                gate_reason,
+                timestamp_ms,
+            );
+            self.emit_debug(
+                "info",
+                &format!(
+                    "Final voice batch #{}: reason={}, duration={:.3}s, endsUtterance={}, rms={:.1}",
+                    self.segment_counter,
+                    gate_reason.as_str(),
+                    job.audio_duration_secs,
+                    job.ends_utterance,
+                    job.rms
+                ),
+            );
+            if let Err(error) = self.enqueue_batch(job).await {
+                if first_error.is_none() {
                     first_error = Some(error.to_string());
                 }
             }
@@ -1088,8 +1201,6 @@ impl STTProvider for GroqWhisperSTT {
                     Some("Groq transcript accumulator terminated unexpectedly".to_string());
             }
         }
-        self.audio_buffer.clear();
-        self.trailing_silence_samples = 0;
         self.is_streaming = false;
         self.result_tx = None;
         self.start_time = None;
@@ -1217,6 +1328,32 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct RecordedRequest {
+        sequence: u64,
+        samples: Vec<i16>,
+    }
+
+    struct RecordingProcessor {
+        calls: AsyncMutex<Vec<RecordedRequest>>,
+    }
+
+    #[async_trait]
+    impl GroqBatchProcessor for RecordingProcessor {
+        async fn transcribe(
+            &self,
+            sequence: u64,
+            samples: Vec<i16>,
+            _config: GroqConfig,
+        ) -> MockOutcome {
+            self.calls
+                .lock()
+                .await
+                .push(RecordedRequest { sequence, samples });
+            Ok(transcription("synthetic speech"))
+        }
+    }
+
     fn transcription(text: &str) -> NormalizedGroqTranscription {
         NormalizedGroqTranscription {
             text: text.to_string(),
@@ -1228,12 +1365,37 @@ mod tests {
         }
     }
 
+    fn gate_metrics(real_samples: usize, positive_frames: usize) -> VoiceBatchMetrics {
+        let total_frames = real_samples.div_ceil(crate::stt::local_voice_gate::FRAME_SAMPLES);
+        VoiceBatchMetrics {
+            total_frames,
+            positive_frames,
+            positive_ratio: if total_frames == 0 {
+                0.0
+            } else {
+                positive_frames as f32 / total_frames as f32
+            },
+            positive_samples: real_samples,
+            positive_duration_ms: real_samples as f64 * 1_000.0 / SAMPLE_RATE as f64,
+            longest_positive_run_frames: positive_frames,
+            longest_positive_run_ms: positive_frames as f64 * f64::from(FRAME_DURATION_MS),
+            longest_silence_run_frames: 0,
+            longest_silence_run_ms: 0.0,
+            real_samples,
+            total_duration_ms: real_samples as f64 * 1_000.0 / SAMPLE_RATE as f64,
+        }
+    }
+
     fn batch_job(sequence: u64, request_type: GroqRequestType) -> GroqBatchJob {
+        let samples = vec![200; 16];
         GroqBatchJob {
             sequence,
-            samples: vec![200; 16],
+            gate_metrics: gate_metrics(samples.len(), 1),
+            samples,
             config: GroqConfig::default(),
             request_type,
+            ends_utterance: false,
+            gate_reason: VoiceBatchReason::MaxDuration,
             timestamp_ms: sequence * 100,
             audio_duration_secs: 0.001,
             rms: 200.0,
@@ -1243,18 +1405,27 @@ mod tests {
     fn silent_batch_job(sequence: u64) -> GroqBatchJob {
         GroqBatchJob {
             samples: Vec::new(),
+            gate_metrics: gate_metrics(0, 0),
             rms: 0.0,
             ..batch_job(sequence, GroqRequestType::Normal)
         }
     }
 
     fn audio_chunk(samples: usize, timestamp_ms: u64) -> AudioChunk {
+        pcm_chunk(vec![1_000; samples], timestamp_ms, false)
+    }
+
+    fn pcm_chunk(pcm_data: Vec<i16>, timestamp_ms: u64, is_speech: bool) -> AudioChunk {
         AudioChunk {
-            pcm_data: vec![200; samples],
+            pcm_data,
             source: crate::audio::AudioSource::Mic,
             timestamp_ms,
-            is_speech: false,
+            is_speech,
         }
+    }
+
+    fn pcm_frames(value: i16, frames: usize) -> Vec<i16> {
+        vec![value; frames * crate::stt::local_voice_gate::FRAME_SAMPLES]
     }
 
     fn controlled_processor(
@@ -1293,6 +1464,44 @@ mod tests {
         })
     }
 
+    fn recording_processor() -> Arc<RecordingProcessor> {
+        Arc::new(RecordingProcessor {
+            calls: AsyncMutex::new(Vec::new()),
+        })
+    }
+
+    async fn recording_provider(
+        segment_duration_secs: f32,
+    ) -> (
+        GroqWhisperSTT,
+        Arc<RecordingProcessor>,
+        mpsc::Receiver<TranscriptResult>,
+    ) {
+        let processor = recording_processor();
+        let mut provider = GroqWhisperSTT::with_api_key("test-key");
+        provider.set_party("You");
+        provider.set_config(GroqConfig {
+            segment_duration_secs,
+            ..GroqConfig::default()
+        });
+        provider.batch_processor_override = Some(processor.clone());
+        let (result_tx, result_rx) = mpsc::channel(16);
+        provider.start_stream(result_tx).await.unwrap();
+        (provider, processor, result_rx)
+    }
+
+    async fn assert_signal_makes_no_request(pcm_data: Vec<i16>, is_speech: bool) {
+        let (mut provider, processor, mut result_rx) = recording_provider(5.0).await;
+        provider
+            .feed_audio(pcm_chunk(pcm_data, 100, is_speech))
+            .await
+            .unwrap();
+        provider.stop_stream().await.unwrap();
+        assert!(processor.calls.lock().await.is_empty());
+        assert_eq!(provider.next_batch_sequence, 0);
+        assert!(result_rx.recv().await.is_none());
+    }
+
     fn spawn_test_worker(
         processor: Arc<dyn GroqBatchProcessor>,
         party: &str,
@@ -1326,6 +1535,228 @@ mod tests {
             receiver.recv().await,
             Some(AccumulatorMsg::Silence)
         ));
+    }
+
+    #[test]
+    fn configured_segment_duration_sets_voice_gate_maximum() {
+        let config = GroqConfig {
+            segment_duration_secs: 2.5,
+            ..GroqConfig::default()
+        };
+        assert_eq!(
+            GroqWhisperSTT::voice_gate_config(&config)
+                .unwrap()
+                .max_batch_ms,
+            2_500
+        );
+    }
+
+    #[tokio::test]
+    async fn local_gate_blocks_silence_noise_impulses_and_unconfirmed_candidates() {
+        assert_signal_makes_no_request(pcm_frames(0, 150), true).await;
+        assert_signal_makes_no_request(pcm_frames(299, 100), true).await;
+
+        let mut isolated_impulse = pcm_frames(1_000, 1);
+        isolated_impulse.extend(pcm_frames(0, 9));
+        assert_signal_makes_no_request(isolated_impulse, false).await;
+
+        let mut separated_impulses = pcm_frames(1_000, 1);
+        separated_impulses.extend(pcm_frames(0, 1));
+        separated_impulses.extend(pcm_frames(1_000, 1));
+        separated_impulses.extend(pcm_frames(0, 7));
+        assert_signal_makes_no_request(separated_impulses, false).await;
+
+        assert_signal_makes_no_request(pcm_frames(1_000, 1), false).await;
+    }
+
+    #[tokio::test]
+    async fn confirmed_short_speech_is_sent_even_below_half_a_second() {
+        let (mut provider, processor, mut result_rx) = recording_provider(5.0).await;
+        let short_speech = pcm_frames(1_000, 3);
+        provider
+            .feed_audio(pcm_chunk(short_speech.clone(), 100, false))
+            .await
+            .unwrap();
+        provider.stop_stream().await.unwrap();
+
+        let calls = processor.calls.lock().await.clone();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].sequence, 1);
+        assert_eq!(calls[0].samples, short_speech);
+        assert_eq!(calls[0].samples.len(), 960);
+        assert!(calls[0].samples.len() < SAMPLE_RATE as usize / 2);
+
+        let partial = result_rx.recv().await.unwrap();
+        let final_result = result_rx.recv().await.unwrap();
+        assert!(!partial.is_final);
+        assert!(final_result.is_final);
+        assert_eq!(partial.text, final_result.text);
+        assert!(result_rx.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn gate_to_job_preserves_pre_roll_internal_silence_and_every_sample() {
+        let (mut provider, processor, _result_rx) = recording_provider(5.0).await;
+        let pre_roll = pcm_frames(0, 15);
+        let confirmed = pcm_frames(1_000, 3);
+        let internal_silence = pcm_frames(0, 2);
+        let resumed = pcm_frames(1_000, 1);
+
+        provider
+            .feed_audio(pcm_chunk(pre_roll.clone(), 100, true))
+            .await
+            .unwrap();
+        provider
+            .feed_audio(pcm_chunk(confirmed.clone(), 120, false))
+            .await
+            .unwrap();
+        provider
+            .feed_audio(pcm_chunk(internal_silence.clone(), 140, true))
+            .await
+            .unwrap();
+        provider
+            .feed_audio(pcm_chunk(resumed.clone(), 160, false))
+            .await
+            .unwrap();
+        provider.stop_stream().await.unwrap();
+
+        let mut expected = pre_roll;
+        expected.extend(confirmed);
+        expected.extend(internal_silence.clone());
+        expected.extend(resumed);
+        let calls = processor.calls.lock().await.clone();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].samples, expected);
+        let internal_start = 18 * crate::stt::local_voice_gate::FRAME_SAMPLES;
+        let internal_end = internal_start + internal_silence.len();
+        assert!(calls[0].samples[internal_start..internal_end]
+            .iter()
+            .all(|sample| *sample == 0));
+    }
+
+    #[tokio::test]
+    async fn segment_duration_controls_max_batch_and_max_batch_does_not_end_utterance() {
+        let (mut provider, processor, mut result_rx) = recording_provider(2.0).await;
+        provider
+            .feed_audio(pcm_chunk(pcm_frames(1_000, 100), 100, false))
+            .await
+            .unwrap();
+        provider.stop_stream().await.unwrap();
+
+        let calls = processor.calls.lock().await.clone();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].samples.len(), 2 * SAMPLE_RATE as usize);
+        let partial = result_rx.recv().await.unwrap();
+        let final_result = result_rx.recv().await.unwrap();
+        assert!(!partial.is_final);
+        assert!(final_result.is_final);
+        assert!(result_rx.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn endpoint_waits_for_final_response_then_sends_speech_before_silence() {
+        let (processor, mut started_rx, mut releases) = controlled_processor(&[1]);
+        let (batch_tx, mut accumulator_rx, worker) =
+            spawn_test_worker(processor, "You", GROQ_BATCH_QUEUE_CAPACITY);
+        let mut final_job = batch_job(1, GroqRequestType::Normal);
+        final_job.ends_utterance = true;
+        final_job.gate_reason = VoiceBatchReason::Endpoint;
+        batch_tx.send(final_job).await.unwrap();
+        drop(batch_tx);
+
+        assert_eq!(started_rx.recv().await, Some(1));
+        assert!(accumulator_rx.try_recv().is_err());
+        releases
+            .remove(&1)
+            .unwrap()
+            .send(Ok(transcription("final speech")))
+            .unwrap();
+
+        assert_eq!(receive_speech(&mut accumulator_rx).await, "final speech");
+        expect_silence(&mut accumulator_rx).await;
+        assert!(worker.await.unwrap().is_ok());
+        assert!(accumulator_rx.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn rejected_final_response_produces_exactly_one_silence() {
+        let processor = scripted_processor([(1, Ok(transcription(".")))]);
+        let (batch_tx, mut accumulator_rx, worker) =
+            spawn_test_worker(processor, "You", GROQ_BATCH_QUEUE_CAPACITY);
+        let mut final_job = batch_job(1, GroqRequestType::Normal);
+        final_job.ends_utterance = true;
+        final_job.gate_reason = VoiceBatchReason::Endpoint;
+        batch_tx.send(final_job).await.unwrap();
+        drop(batch_tx);
+
+        expect_silence(&mut accumulator_rx).await;
+        assert!(worker.await.unwrap().is_ok());
+        assert!(accumulator_rx.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn failed_final_residual_closes_utterance_once() {
+        let processor = scripted_processor([(1, Err("final residual failed".to_string()))]);
+        let (batch_tx, mut accumulator_rx, worker) =
+            spawn_test_worker(processor, "You", GROQ_BATCH_QUEUE_CAPACITY);
+        let mut final_job = batch_job(1, GroqRequestType::Residual);
+        final_job.ends_utterance = true;
+        final_job.gate_reason = VoiceBatchReason::Finish;
+        batch_tx.send(final_job).await.unwrap();
+        drop(batch_tx);
+
+        expect_silence(&mut accumulator_rx).await;
+        assert_eq!(
+            worker.await.unwrap().unwrap_err(),
+            "final residual failed".to_string()
+        );
+        assert!(accumulator_rx.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn secondary_rms_gate_blocks_ready_batch_without_calling_processor() {
+        let processor = scripted_processor([]);
+        let (batch_tx, mut accumulator_rx, worker) =
+            spawn_test_worker(processor.clone(), "Them", GROQ_BATCH_QUEUE_CAPACITY);
+        let mut quiet_ready_job = batch_job(1, GroqRequestType::Normal);
+        quiet_ready_job.samples = vec![99; 960];
+        quiet_ready_job.rms = 99.0;
+        quiet_ready_job.gate_metrics = gate_metrics(960, 3);
+        quiet_ready_job.ends_utterance = true;
+        batch_tx.send(quiet_ready_job).await.unwrap();
+        drop(batch_tx);
+
+        expect_silence(&mut accumulator_rx).await;
+        assert!(worker.await.unwrap().is_ok());
+        assert!(processor.calls.lock().await.is_empty());
+        assert!(accumulator_rx.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn voice_gate_is_reset_between_streams() {
+        let processor = recording_processor();
+        let mut provider = GroqWhisperSTT::with_api_key("test-key");
+        provider.batch_processor_override = Some(processor.clone());
+
+        let (first_tx, mut first_rx) = mpsc::channel(4);
+        provider.start_stream(first_tx).await.unwrap();
+        provider
+            .feed_audio(pcm_chunk(pcm_frames(1_000, 1), 100, false))
+            .await
+            .unwrap();
+        provider.stop_stream().await.unwrap();
+        assert!(first_rx.recv().await.is_none());
+
+        let (second_tx, mut second_rx) = mpsc::channel(4);
+        provider.start_stream(second_tx).await.unwrap();
+        provider
+            .feed_audio(pcm_chunk(pcm_frames(1_000, 2), 200, false))
+            .await
+            .unwrap();
+        provider.stop_stream().await.unwrap();
+        assert!(second_rx.recv().await.is_none());
+        assert!(processor.calls.lock().await.is_empty());
+        assert_eq!(provider.next_batch_sequence, 0);
     }
 
     #[tokio::test]
