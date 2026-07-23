@@ -2,144 +2,213 @@
 
 ## Objetivo
 
-O NexQ-Sales-Copilot é um copiloto local para chamadas comerciais no Windows. O aplicativo captura separadamente o microfone do closer e o áudio reproduzido pelo sistema, transcreve os dois canais, organiza a conversa e, futuramente, usa o Codex para gerar sugestões discretas durante a reunião e um relatório estruturado após o encerramento. A primeira versão é local e destinada a um único usuário.
+O NexQ-Sales-Copilot é um copiloto local para chamadas comerciais no Windows. O aplicativo captura separadamente o microfone do closer e o áudio reproduzido pelo sistema, transcreve os dois canais e organiza a conversa. A integração futura com Codex deverá gerar sugestões discretas durante a reunião e um relatório estruturado após o encerramento. A primeira versão é local e destinada a um único usuário.
 
-## Ambiente e baseline técnico
+## Snapshot auditado
 
+- Data da auditoria: 23 de julho de 2026.
+- Branch: `main`.
+- Baseline funcional auditado: `38495302ca2f9148b31b9cb399947d0ef0c9574a` (`feat(stt): drive local voice gate with Silero probabilities`).
+- Commit imediatamente anterior do classificador: `7af9a276d9fbf90a24a90ee59e4a190b635a47ec` (`feat(vad): add embedded Silero speech classifier`).
 - Plataforma prioritária: Windows 11 x64.
 - Desktop: Tauri 2.
 - Frontend: React e TypeScript.
 - Backend: Rust.
-- Toolchain nativo disponível: LLVM, libclang, CMake e Ninja instalados.
-- Frontend compilando.
-- Backend compilando.
-- Testes Rust: 45 aprovados.
-- Clippy: há um baseline preexistente de 86 diagnósticos quando executado com `-D warnings`. Esses diagnósticos não foram introduzidos pela correção de isolamento entre reuniões.
+- Frontend e backend já compilavam no baseline anterior.
+
+Esta atualização é apenas documental. O código funcional auditado continua sendo o baseline `3849530`; nenhum threshold, endpointing, gate de resposta, arquivo Rust, frontend, persistência ou comportamento de captura foi alterado.
+
+## Validação automatizada deste snapshot
+
+- `cargo test --manifest-path src-tauri\Cargo.toml --lib`: 108 testes descobertos; 107 aprovados, 1 benchmark diagnóstico ignorado e 0 falhas.
+- `cargo test --manifest-path src-tauri\Cargo.toml`: mesmos 108 testes de biblioteca, com 107 aprovados, 1 ignorado e 0 falhas; targets de binário e doc-tests também concluíram sem falhas.
+- `cargo check --manifest-path src-tauri\Cargo.toml --lib`: aprovado.
+- `cargo fmt --all --check` na raiz: não é aplicável porque não existe `Cargo.toml` na raiz.
+- `cargo fmt --all --check` em `src-tauri`: reprovado pelo baseline amplo de formatação em arquivos antigos; nenhuma formatação foi aplicada.
+- `rustfmt --edition 2021 --check` direcionado a `silero_vad.rs`, `local_voice_gate.rs` e `groq_whisper.rs`: aprovado.
+- `cargo clippy --manifest-path src-tauri\Cargo.toml --all-targets --all-features -- -D warnings`: reprovado pelo baseline preexistente, com 84 erros no target `lib` e 85 no target `lib test`.
+- O Clippy não reportou diagnóstico em `silero_vad.rs` nem em `local_voice_gate.rs`. Os dois diagnósticos exibidos em `groq_whisper.rs` recaem sobre linhas existentes desde o commit original `4a79580`, não sobre a integração Silero.
+- Warnings não bloqueantes dos testes: stdout do linker MSVC ao criar as bibliotecas de importação `.lib`/`.exp`.
 
 ## Funcionalidades validadas
 
-- Captura do microfone validada.
-- Captura do áudio do sistema validada.
-- Groq STT com o modelo `whisper-large-v3-turbo` validado nos dois canais.
+- Captura do microfone no canal You.
+- Captura do áudio do sistema no canal Them.
+- Groq STT com o modelo `whisper-large-v3-turbo` nos dois canais.
+- Isolamento dos stores de transcript entre reuniões.
+- Barreira determinística de encerramento.
+- Gate de resposta Groq baseado em `verbose_json`.
+- Fila FIFO limitada e worker ordenado por canal.
+- Classificação local de voz com Silero VAD v6.2.1 antes do envio à Groq.
 
-## Correção mais recente: isolamento do transcript entre reuniões
+## Arquitetura STT atual
 
-Foi implementada uma correção para limpar separadamente os stores Zustand mantidos pelas janelas do launcher e do overlay entre reuniões.
+```text
+PCM i16 mono 16 kHz
+→ Silero VAD v6.2.1
+→ LocalVoiceGate
+→ ReadyBatch
+→ fila FIFO limitada por canal
+→ worker Groq ordenado por canal
+→ defesa RMS 100
+→ Groq whisper-large-v3-turbo / verbose_json
+→ gate de resposta
+→ acumulador de utterance
+→ barreira determinística de encerramento
+```
 
-A correção:
+### Classificação e gate local
 
-- adiciona um reset completo da sessão do transcript;
-- reseta o store do launcher antes de iniciar a captura;
-- reseta o store próprio do overlay ao receber o evento de início da reunião;
-- reinicia o checkpoint de persistência da reunião;
-- só limpa o transcript no encerramento depois que o flush final informado pelo frontend termina com sucesso;
-- adiciona logs de ciclo de vida sem registrar conteúdo do transcript.
+- O artefato oficial `silero_vad.onnx` da versão `v6.2.1` está incorporado ao binário com `include_bytes!`.
+- SHA-256 fixado e conferido: `1a153a22f4509e292a94e67d6f9b85e8deb25b4988682b7e174c65279d8788e3`.
+- Não existe download do modelo em runtime.
+- Cada instância de `GroqWhisperSTT` cria sua própria sessão ONNX, estado recorrente, buffer parcial, `LocalVoiceGate`, fila e worker. You e Them não compartilham estado.
+- Silero apenas classifica a probabilidade de voz em frames de 512 amostras, equivalentes a 32 ms em 16 kHz.
+- O `LocalVoiceGate` usa somente as probabilidades Silero para ativação e endpointing. Ele não calcula nem consulta RMS.
+- O VAD RMS legado do módulo de áudio ainda pode preencher `AudioChunk.is_speech` para outros usos, mas esse campo não ativa o `LocalVoiceGate` nem decide requests Groq.
+- Os thresholds atuais continuam sendo a hipótese inicial não calibrada: entrada `0,50`, saída negativa abaixo de `0,35`, duas evidências positivas consecutivas, pre-roll de `320 ms`, endpoint após `704 ms` e post-roll de `192 ms`.
+- O threshold RMS `100` permanece somente como defesa secundária dentro do worker, depois que o Silero e o `LocalVoiceGate` já aprovaram o lote.
+- A Groq continua sendo a única responsável pela transcrição. Whisper Local não foi implementado.
 
-Arquivos alterados nessa correção:
+### Ordenação e independência
 
-- `src/App.tsx`
-- `src/stores/meetingStore.ts`
-- `src/stores/transcriptStore.ts`
+- Cada canal possui uma fila `mpsc` FIFO limitada a seis lotes.
+- O worker de cada provider processa no máximo uma requisição Groq por vez e preserva a ordem de entrada dos lotes daquele canal.
+- Backpressure aguarda espaço na fila em vez de descartar silenciosamente um `ReadyBatch`.
+- You e Them possuem providers, sequências, filas e workers independentes; uma requisição lenta em um canal não reordena nem bloqueia o worker do outro.
 
-Commit mais recente:
+### Encerramento
 
-- Hash completo: `e577d6e8c6c90faee82a05d93be0fed55a9570c5`
-- Hash curto: `e577d6e`
-- Mensagem: `fix: isolate transcript state between meetings`
+- O provider classifica o remainder final do Silero, finaliza somente fala confirmada no `LocalVoiceGate` e enfileira o residual válido.
+- Em seguida fecha o produtor da fila, aguarda o worker drenar todos os lotes, envia `Flush` ao acumulador e aguarda o acumulador terminar.
+- A barreira externa aguarda o pipeline e os tasks de transcript antes de devolver o snapshot final ao frontend.
+- Os testes automatizados cobrem resposta atrasada, drenagem de lotes, residual final, erro durante stop, independência dos canais e ausência de task de transcript após o retorno.
+- A implementação da barreira externa não foi alterada pelos commits do Silero.
 
-### Teste manual de duas reuniões consecutivas
+## Correção do manifesto Windows
 
-O teste manual confirmou que, ao encerrar a primeira reunião e iniciar a segunda, os estados de transcript do launcher e do overlay são reinicializados separadamente, evitando que segmentos já presentes no frontend sejam carregados diretamente de uma reunião para a seguinte.
+- O commit `2f7b4d808fd2339f8a3da44deffb1bb3c33948eb` (`fix(build): embed Windows manifest in Rust tests`) incorporou um manifesto ao harness Rust.
+- A leitura do recurso `#1` do executável de testes com `mt.exe -inputresource` confirmou:
+  - `Microsoft.Windows.Common-Controls`;
+  - `version="6.0.0.0"`.
+- O harness executou os 108 testes sem a falha de inicialização anterior.
+- A validação isolada de schema do `mt.exe` ainda retorna `c10100b7` para `processorArchitecture="*"`. Isso é uma característica do manifesto fonte atual, não impediu a incorporação do recurso nem a execução do harness.
 
-Permanece uma limitação: respostas atrasadas da Groq ainda não carregam `meetingId` nem `captureSessionId`. Por isso, uma resposta iniciada durante uma reunião pode chegar depois do reset e não há identificação suficiente no evento para descartá-la com segurança ou associá-la inequivocamente à sessão correta.
+## Resultado manual inicial do Silero
 
-## Bug confirmado: reuniões curtas sem transcript salvo
+O teste inicial fornecido pelo usuário registrou:
 
-Foi confirmado um problema distinto da limpeza dos stores:
+```text
+Silêncio:
+nenhuma transcrição observada no teste inicial.
 
-- reuniões de aproximadamente 15 e 30 segundos exibem transcript ao vivo;
-- ao abrir essas reuniões salvas, aparecem zero palavras ou nenhum transcript;
-- uma reunião de aproximadamente um minuto foi salva corretamente;
-- uma reunião de 11 segundos indicou duas palavras, mas elas eram apenas transcrições de ponto (`"."`) e não havia conteúdo salvo;
-- a principal suspeita é que a persistência periódica não ocorra a tempo em reuniões curtas ou que o flush final encerre sem aguardar segmentos e requisições ainda pendentes.
+Som curto do Windows:
+transcrito como “Música”.
+Resultado considerado aceitável temporariamente porque não houve frase inventada.
 
-Não há correção implementada para esse bug neste momento.
+Vídeo no YouTube:
+captura e transcrição do canal Them funcionaram no teste inicial.
+```
 
-## Diagnóstico confirmado: encerramento e persistência do transcript
+Esse resultado é um baseline preliminar. A contagem de requests Groq e as probabilidades Silero não foram registradas nesse teste. A calibração não está concluída, e o teste não demonstra que todos os sons não verbais serão rejeitados.
 
-A instrumentação temporária e a inspeção do fluxo confirmaram que:
+O texto isolado `Música` para um som curto do Windows não reprova sozinho a primeira versão, conforme a decisão atual do usuário. Não existe filtro específico para `Música`, e o gate de resposta não foi alterado para rejeitar descrições de música.
 
-- `stop_capture` encerra os produtores de áudio, mas retorna ao frontend antes da conclusão do task assíncrono que drena os chunks e encerra os providers STT;
-- por isso, um segmento final pode ser emitido depois do snapshot usado pelo flush final, depois de `end_meeting` e depois do reset dos stores;
-- o checkpoint periódico de 30 segundos é executado, mas não persiste segmentos enquanto o primeiro item ainda não persistido permanece parcial, pois a seleção exige um prefixo contíguo de segmentos finais;
-- reuniões curtas podem terminar antes do primeiro checkpoint e dependem integralmente do flush de encerramento;
-- não há correção implementada para essa corrida neste momento.
+O roteiro completo, a tabela de registro e os critérios de decisão estão em [`docs/SILERO_MANUAL_VALIDATION.md`](docs/SILERO_MANUAL_VALIDATION.md).
 
-## Diagnóstico confirmado: detecção de voz e ruído
+## Itens antigos corrigidos ou reclassificados
 
-- O VAD atual é baseado em RMS, usa threshold fixo de `300` sobre energia suavizada e preenche `AudioChunk.is_speech`.
-- O resultado desse VAD não controla o envio ao provider Groq: todos os chunks não mutados continuam sendo encaminhados a `feed_audio`.
-- O provider Groq aplica outro threshold fixo: lotes com RMS menor que `100` são tratados como silêncio; lotes com RMS maior ou igual a `100` podem ser enviados à API.
-- Qualquer resposta textual não vazia, fora da pequena lista de frases exatas reconhecidas como alucinação, é convertida em `Speech`.
-- Não existe cancelamento de eco acústico (AEC) no pipeline atual.
-- A barra visual usa `RMS / 3000`, suavização EMA e escala logarítmica. Ela amplifica níveis baixos e não representa diretamente o gate RMS usado pelo provider Groq.
-- Não há correção implementada para detecção de voz, ruído, alucinações ou vazamento acústico neste momento.
+| Afirmação anterior | Estado atual |
+| --- | --- |
+| Silêncio sempre é encaminhado à Groq | Resolvido para o fluxo normal: somente lotes com fala confirmada pelo Silero/`LocalVoiceGate` entram na fila. A validação manual completa ainda deve confirmar o comportamento no ambiente real. |
+| O gate local usa apenas RMS | Resolvido: ativação e endpointing usam probabilidades Silero; RMS 100 é apenas defesa secundária. |
+| Requests Groq do mesmo canal podem terminar fora de ordem | Resolvido: fila FIFO limitada e um worker por provider serializam as requests de cada canal. |
+| O test harness Windows continua quebrado | Resolvido pelo manifesto incorporado; os testes executaram no Windows. |
+| O `LocalVoiceGate` está desconectado do provider | Resolvido: o provider alimenta o gate com frames e probabilidades Silero e enfileira seus `ReadyBatch`. |
+| A barreira de encerramento ainda não foi implementada | Resolvido pelos commits `722a0ad` e `a693c9e`; o stop aguarda pipeline, providers e tasks de transcript. |
+| Reuniões curtas podem perder o transcript final por snapshot prematuro | Histórico do diagnóstico anterior; a barreira determinística e o flush ordenado cobrem a corrida que havia sido identificada. |
 
-## Validação manual: barreira de encerramento
+## Histórico preservado
 
-A barreira determinística de encerramento foi validada novamente em uma chamada encerrada enquanto havia uma requisição Groq ativa. O teste confirmou a seguinte ordem:
+### Isolamento do transcript entre reuniões
 
-1. a requisição Groq em andamento terminou;
-2. o acumulador recebeu `Flush`;
-3. os tasks de transcript terminaram;
-4. `stop_capture_returning` ocorreu somente depois;
-5. todos os segmentos foram persistidos;
-6. `end_meeting` ocorreu por último.
+O commit `e577d6e8c6c90faee82a05d93be0fed55a9570c5` isolou e reinicializou os stores Zustand do launcher e do overlay entre reuniões. A preocupação posterior com respostas antigas sem identidade suficiente passou a ser mitigada pela barreira determinística, que não devolve o stop enquanto pertencem requests e tasks à captura encerrada.
 
-O encerramento no meio da fala também preservou os segmentos finais. Essa validação confirma que `stop_capture` não retorna antes das requisições e dos tasks pertencentes à captura encerrada terminarem.
+Essa correção histórica:
 
-## Validação manual: gate de resposta Groq
+- adicionou reset completo da sessão do transcript;
+- passou a resetar o launcher antes de iniciar a captura;
+- passou a resetar o store próprio do overlay ao receber o início da reunião;
+- reiniciou o checkpoint de persistência;
+- manteve o transcript até o flush final informar sucesso;
+- envolveu `src/App.tsx`, `src/stores/meetingStore.ts` e `src/stores/transcriptStore.ts`.
 
-O gate baseado em `verbose_json` foi apenas parcialmente eficaz:
+### Reuniões curtas e encerramento
 
-- respostas contendo somente espaços ou pontuação isolada foram rejeitadas corretamente;
-- a resposta agora fornece metadados reais por segmento, incluindo `no_speech_prob` e `avg_logprob` quando presentes;
-- alucinações textuais plausíveis ainda foram aceitas como `Speech` durante aproximadamente o primeiro minuto sem fala humana no canal You;
-- no silêncio observado, `no_speech_prob` retornou `0.0` tanto para resultados rejeitados quanto para alucinações aceitas;
-- alucinações aceitas ocorreram com RMS baixo, incluindo valores aproximados de `110`, `116`, `138` e `199`;
-- `avg_logprob` das alucinações aceitas variou aproximadamente entre `-0.38` e `-0.65` em vários casos;
-- um som curto reproduzido pelo Windows no canal Them também foi convertido em texto inventado;
-- depois desses casos, fala normal nos canais You e Them continuou sendo transcrita.
+Antes da barreira, reuniões de aproximadamente 15 e 30 segundos podiam exibir transcript ao vivo e salvar zero palavras, enquanto uma reunião próxima de um minuto era persistida. Uma reunião de 11 segundos chegou a indicar duas palavras formadas apenas por `"."`. A causa confirmada era o retorno de `stop_capture` antes da drenagem dos providers e tasks, combinado com reuniões que terminavam antes do checkpoint periódico.
 
-Portanto, os thresholds atuais de `no_speech_prob` e `avg_logprob` não distinguem de forma confiável silêncio real, ruído curto e fala humana nesse ambiente. O gate elimina artefatos simples de pontuação e melhora a observabilidade, mas não resolve as alucinações durante silêncio.
+Depois da correção, a validação manual da barreira observou:
 
-## Instrumentação temporária de diagnóstico
+1. conclusão da request Groq ativa;
+2. recebimento de `Flush` pelo acumulador;
+3. término dos tasks de transcript;
+4. retorno de `stop_capture` somente depois;
+5. persistência dos segmentos;
+6. `end_meeting` por último.
 
-Os logs `NEXQ_TRANSCRIPT_DIAG` registram somente metadados técnicos, como timestamps, janela, IDs técnicos, contagens, RMS, duração de lote e resultado das etapas. Os logs frontend ficam restritos ao modo de desenvolvimento e os logs Rust a builds de debug.
+O encerramento no meio da fala preservou os segmentos finais no teste manual anterior.
 
-A instrumentação não altera a ordem funcional do encerramento, não adiciona espera por tasks ou requisições, não muda thresholds, seleção de segmentos, persistência, schemas ou migrations. Texto de transcript, áudio, tokens, chaves e corpos de requisição não são registrados.
+### Diagnóstico anterior de silêncio e gate de resposta
+
+Antes do gate local, o provider podia enviar lotes de baixo RMS à Groq, e o gate `verbose_json` aceitava algumas frases plausíveis produzidas durante silêncio ou ruído. Os metadados `no_speech_prob` e `avg_logprob` não separaram esses casos de forma confiável. Esse diagnóstico motivou o gate acústico local com Silero.
+
+Nos testes históricos anteriores ao Silero:
+
+- pontuação e espaços isolados foram rejeitados;
+- alucinações plausíveis foram aceitas com RMS aproximado de `110`, `116`, `138` e `199`;
+- `avg_logprob` dessas respostas variou aproximadamente entre `-0,38` e `-0,65`;
+- `no_speech_prob` chegou a `0,0` tanto em resultados rejeitados quanto em alucinações aceitas;
+- fala normal continuou sendo transcrita depois dos falsos positivos.
+
+O gate de resposta continua útil para rejeitar conteúdo vazio, pontuação isolada, frases exatas conhecidas e metadados extremos. Ele não deve ser tratado como classificador acústico nem como garantia contra toda descrição de som não verbal.
+
+### Instrumentação de diagnóstico
+
+Os logs `NEXQ_TRANSCRIPT_DIAG` registram metadados técnicos em builds de debug: canal, sequência, duração, RMS, estado do gate, probabilidades agregadas, runs positivos, tamanho lógico da fila e eventos de encerramento. Não registram chaves, tokens, áudio nem conteúdo integral do transcript por padrão.
+
+## Limitações abertas
+
+- A matriz de validação manual ainda não foi executada integralmente.
+- Os thresholds Silero/endpointing são hipóteses iniciais e não estão calibrados para o ambiente do usuário.
+- Uma única ocorrência de `Música` para um chime foi tolerada; sons não verbais ainda podem produzir descrições ou texto.
+- A contagem de requests e as probabilidades do teste manual inicial não foram preservadas.
+- O idioma default de `GroqConfig` no backend ainda é `en`; a validação em português deve confirmar a configuração `pt`.
+- Não há AEC, noise suppression nem garantia de eliminação de vazamento acústico; fones continuam recomendados.
+- Não há retry, backoff ou reprocessamento automático da fila Groq.
+- Não há filtro específico para `Música`.
+- Whisper Local não foi implementado.
+- Diarização de múltiplos participantes remotos não faz parte da primeira versão.
+- Codex App Server ainda não foi integrado como provider de análise.
+- O baseline global de formatação e Clippy permanece aberto e não foi alterado nesta tarefa.
+
+## Backlog reclassificado
+
+- Incluir `meetingId` e `captureSessionId` nos eventos continua sendo hardening útil, embora a barreira impeça resultados pertencentes à captura encerrada de escapar após o stop.
+- Rejeição de pontuação isolada, fila ordenada e espera das requests no encerramento estão resolvidas.
+- Retry, backoff, reprocessamento e eventual deduplicação continuam abertos.
+- Português como default do backend continua aberto.
+- A integração futura com Codex App Server permanece separada do STT.
 
 ## Próximo passo
 
-Auditar um gate local anterior ao envio de áudio para a Groq. A auditoria deve incluir, no mínimo:
+Executar o roteiro de [`docs/SILERO_MANUAL_VALIDATION.md`](docs/SILERO_MANUAL_VALIDATION.md), preencher a tabela com contagem de requests e evidência agregada e decidir:
 
-- verificar por que `AudioChunk.is_speech` atualmente não controla o envio ao provider;
-- medir a proporção de frames classificados como voz em cada lote;
-- avaliar WebRTC VAD para decisões rápidas por frame;
-- avaliar Silero VAD para uma classificação local mais robusta;
-- criar fixtures com silêncio, ruído ambiente, sons curtos do Windows, fala curta e fala distante.
+1. aprovar o baseline para a primeira versão;
+2. repetir cenários inconclusivos;
+3. abrir calibração somente se houver um padrão reproduzível e mensurado.
 
-Não tentar resolver o problema apenas aumentando thresholds RMS, `no_speech_prob` ou `avg_logprob`. Qualquer alteração futura de thresholds deve ser validada contra fala curta legítima e fala distante para evitar falsos negativos.
-
-## Backlog posterior
-
-- Incluir `meetingId` e `captureSessionId` nos eventos.
-- Implementar cancelamento e espera das requisições Groq no encerramento.
-- Definir português como idioma padrão.
-- Filtrar transcrições `"."` geradas durante silêncio.
-- Implementar fila, retry, backoff, ordenação e deduplicação.
-- Integrar futuramente o Codex App Server como provedor de análise separado do STT.
+Não alterar thresholds com base em uma ocorrência isolada.
 
 ## Segurança e privacidade
 
-Este documento não contém chaves, tokens, segredos nem conteúdo das transcrições.
+Este documento não contém chaves, tokens, segredos, áudio nem conteúdo de chamadas.
