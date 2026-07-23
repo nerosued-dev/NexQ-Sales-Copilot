@@ -1,21 +1,16 @@
-//! Pure, deterministic local voice gate for 16 kHz mono PCM.
+//! Pure, deterministic endpointing for classified 16 kHz mono PCM frames.
 //!
-//! This module is deliberately independent from capture callbacks, STT providers,
-//! networking, Tauri, persistence, and wall-clock time. It is not connected to
-//! the running transcription pipeline yet.
+//! The gate does not inspect PCM energy and does not run inference. Production
+//! frames arrive with probabilities from Silero VAD; tests can inject explicit
+//! probabilities without loading ONNX Runtime.
 
 use std::collections::VecDeque;
 use std::fmt;
 
 pub const SAMPLE_RATE_HZ: u32 = 16_000;
-pub const FRAME_DURATION_MS: u32 = 20;
-pub const FRAME_SAMPLES: usize = 320;
+pub const FRAME_DURATION_MS: u32 = 32;
+pub const FRAME_SAMPLES: usize = 512;
 
-/// A frame emitted by [`FixedFrameSplitter`].
-///
-/// Full frames contain [`FRAME_SAMPLES`] samples. The explicit final frame may
-/// contain fewer samples; `valid_samples` always describes the real PCM and no
-/// zero padding is included.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PcmFrame {
     pub samples: Vec<i16>,
@@ -23,111 +18,15 @@ pub struct PcmFrame {
     pub start_sample: u64,
 }
 
-impl PcmFrame {
-    pub fn rms(&self) -> f32 {
-        let valid_samples = self.valid_samples.min(self.samples.len());
-        instantaneous_rms(&self.samples[..valid_samples])
-    }
-}
-
-/// Splits variable-sized PCM chunks into fixed-size frames without loss.
-#[derive(Debug)]
-pub struct FixedFrameSplitter {
-    frame_samples: usize,
-    remainder: Vec<i16>,
-    emitted_samples: u64,
-    accepted_samples: u64,
-}
-
-impl FixedFrameSplitter {
-    pub fn new(frame_samples: usize) -> Result<Self, LocalVoiceGateConfigError> {
-        if frame_samples == 0 {
-            return Err(LocalVoiceGateConfigError::new(
-                "frame_samples must be greater than zero",
-            ));
-        }
-
-        Ok(Self {
-            frame_samples,
-            remainder: Vec::new(),
-            emitted_samples: 0,
-            accepted_samples: 0,
-        })
-    }
-
-    /// Accepts any number of samples and returns only complete frames.
-    pub fn push_samples(&mut self, samples: &[i16]) -> Vec<PcmFrame> {
-        self.accepted_samples = self.accepted_samples.saturating_add(samples.len() as u64);
-        self.remainder.extend_from_slice(samples);
-
-        let complete_samples = self.remainder.len() / self.frame_samples * self.frame_samples;
-        if complete_samples == 0 {
-            return Vec::new();
-        }
-
-        let pending = std::mem::take(&mut self.remainder);
-        let mut frames = Vec::with_capacity(complete_samples / self.frame_samples);
-        for samples in pending[..complete_samples].chunks_exact(self.frame_samples) {
-            frames.push(self.make_frame(samples.to_vec()));
-        }
-        self.remainder
-            .extend_from_slice(&pending[complete_samples..]);
-        frames
-    }
-
-    /// Emits the real, potentially partial remainder without zero padding.
-    pub fn finish(&mut self) -> Option<PcmFrame> {
-        if self.remainder.is_empty() {
-            return None;
-        }
-        let samples = std::mem::take(&mut self.remainder);
-        Some(self.make_frame(samples))
-    }
-
-    pub fn remainder_len(&self) -> usize {
-        self.remainder.len()
-    }
-
-    /// Total real samples accepted, including the current remainder.
-    pub fn timeline_samples(&self) -> u64 {
-        self.accepted_samples
-    }
-
-    fn make_frame(&mut self, samples: Vec<i16>) -> PcmFrame {
-        let valid_samples = samples.len();
-        let frame = PcmFrame {
-            samples,
-            valid_samples,
-            start_sample: self.emitted_samples,
-        };
-        self.emitted_samples = self.emitted_samples.saturating_add(valid_samples as u64);
-        frame
-    }
-}
-
-/// Calculates RMS over real i16 PCM samples without smoothing or state.
-pub fn instantaneous_rms(samples: &[i16]) -> f32 {
-    if samples.is_empty() {
-        return 0.0;
-    }
-
-    let sum_squares = samples
-        .iter()
-        .map(|&sample| {
-            let sample = f64::from(sample);
-            sample * sample
-        })
-        .sum::<f64>();
-    (sum_squares / samples.len() as f64).sqrt() as f32
-}
-
-/// Configurable hypotheses for the first deterministic gate experiments.
+/// Initial backend-only Silero and endpointing hypotheses.
 ///
-/// Durations must be aligned to the 20 ms frame size. The constructor validates
-/// all relationships so changing parameters does not require changing gate logic.
+/// These values are intentionally explicit and are not considered calibrated:
+/// enter at 0.50, leave below 0.35, confirm two positive frames, keep 320 ms
+/// pre-roll, endpoint after 704 ms, and retain 192 ms post-roll.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LocalVoiceGateConfig {
-    pub rms_threshold: f32,
+    pub speech_threshold: f32,
+    pub negative_threshold: f32,
     pub pre_roll_ms: u32,
     pub activation_window_ms: u32,
     pub min_positive_ms: u32,
@@ -138,24 +37,32 @@ pub struct LocalVoiceGateConfig {
 }
 
 impl LocalVoiceGateConfig {
-    /// Initial values for deterministic tests, not calibrated production defaults.
     pub fn initial_test_hypothesis() -> Self {
         Self {
-            rms_threshold: 300.0,
-            pre_roll_ms: 300,
-            activation_window_ms: 200,
-            min_positive_ms: 60,
+            speech_threshold: 0.50,
+            negative_threshold: 0.35,
+            pre_roll_ms: 320,
+            activation_window_ms: 160,
+            min_positive_ms: 64,
             min_consecutive_positive_frames: 2,
-            end_silence_ms: 700,
-            post_roll_ms: 200,
-            max_batch_ms: 5_000,
+            end_silence_ms: 704,
+            post_roll_ms: 192,
+            max_batch_ms: 4_992,
         }
     }
 
     fn validate(&self) -> Result<DerivedConfig, LocalVoiceGateConfigError> {
-        if !self.rms_threshold.is_finite() || self.rms_threshold < 0.0 {
+        if !self.speech_threshold.is_finite() || !(0.0..=1.0).contains(&self.speech_threshold) {
             return Err(LocalVoiceGateConfigError::new(
-                "rms_threshold must be finite and non-negative",
+                "speech_threshold must be finite and within 0..=1",
+            ));
+        }
+        if !self.negative_threshold.is_finite()
+            || !(0.0..=1.0).contains(&self.negative_threshold)
+            || self.negative_threshold >= self.speech_threshold
+        {
+            return Err(LocalVoiceGateConfigError::new(
+                "negative_threshold must be finite, within 0..=1, and below speech_threshold",
             ));
         }
 
@@ -169,12 +76,14 @@ impl LocalVoiceGateConfig {
         ] {
             if duration % FRAME_DURATION_MS != 0 {
                 let message = match name {
-                    "pre_roll_ms" => "pre_roll_ms must align to 20 ms frames",
-                    "activation_window_ms" => "activation_window_ms must align to 20 ms frames",
-                    "min_positive_ms" => "min_positive_ms must align to 20 ms frames",
-                    "end_silence_ms" => "end_silence_ms must align to 20 ms frames",
-                    "post_roll_ms" => "post_roll_ms must align to 20 ms frames",
-                    _ => "max_batch_ms must align to 20 ms frames",
+                    "pre_roll_ms" => "pre_roll_ms must align to 32 ms Silero frames",
+                    "activation_window_ms" => {
+                        "activation_window_ms must align to 32 ms Silero frames"
+                    }
+                    "min_positive_ms" => "min_positive_ms must align to 32 ms Silero frames",
+                    "end_silence_ms" => "end_silence_ms must align to 32 ms Silero frames",
+                    "post_roll_ms" => "post_roll_ms must align to 32 ms Silero frames",
+                    _ => "max_batch_ms must align to 32 ms Silero frames",
                 };
                 return Err(LocalVoiceGateConfigError::new(message));
             }
@@ -209,7 +118,8 @@ impl LocalVoiceGateConfig {
         }
 
         Ok(DerivedConfig {
-            rms_threshold: self.rms_threshold,
+            speech_threshold: self.speech_threshold,
+            negative_threshold: self.negative_threshold,
             pre_roll_frames: frames_for_ms(self.pre_roll_ms),
             activation_window_samples: samples_for_ms(self.activation_window_ms),
             min_positive_samples: samples_for_ms(self.min_positive_ms),
@@ -240,9 +150,38 @@ impl fmt::Display for LocalVoiceGateConfigError {
 
 impl std::error::Error for LocalVoiceGateConfigError {}
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalVoiceGateInputError {
+    EmptyFrame,
+    InvalidValidSampleCount,
+    InvalidProbability,
+    DiscontinuousTimeline { expected: u64, actual: u64 },
+}
+
+impl fmt::Display for LocalVoiceGateInputError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EmptyFrame => formatter.write_str("voice evidence frame cannot be empty"),
+            Self::InvalidValidSampleCount => {
+                formatter.write_str("voice evidence valid sample count is invalid")
+            }
+            Self::InvalidProbability => {
+                formatter.write_str("voice probability must be finite and within 0..=1")
+            }
+            Self::DiscontinuousTimeline { expected, actual } => write!(
+                formatter,
+                "voice evidence timeline is discontinuous: expected sample {expected}, received {actual}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for LocalVoiceGateInputError {}
+
 #[derive(Debug, Clone, Copy)]
 struct DerivedConfig {
-    rms_threshold: f32,
+    speech_threshold: f32,
+    negative_threshold: f32,
     pre_roll_frames: usize,
     activation_window_samples: usize,
     min_positive_samples: usize,
@@ -265,6 +204,8 @@ pub struct VoiceBatchMetrics {
     pub total_frames: usize,
     pub positive_frames: usize,
     pub positive_ratio: f32,
+    pub mean_probability: f32,
+    pub max_probability: f32,
     pub positive_samples: usize,
     pub positive_duration_ms: f64,
     pub longest_positive_run_frames: usize,
@@ -285,13 +226,13 @@ pub struct ReadyBatch {
 #[derive(Debug, Clone)]
 struct ClassifiedFrame {
     frame: PcmFrame,
+    probability: f32,
     positive: bool,
 }
 
-/// Deterministic, per-instance voice gate.
+/// Deterministic endpointing state machine for one audio stream.
 #[derive(Debug)]
 pub struct LocalVoiceGate {
-    splitter: FixedFrameSplitter,
     config: DerivedConfig,
     state: VoiceGateState,
     pre_roll: VecDeque<ClassifiedFrame>,
@@ -299,40 +240,63 @@ pub struct LocalVoiceGate {
     candidate_evidence: Vec<ClassifiedFrame>,
     active_audio: Vec<ClassifiedFrame>,
     trailing_silence_samples: usize,
+    next_sample: u64,
 }
 
 impl LocalVoiceGate {
     pub fn new(config: LocalVoiceGateConfig) -> Result<Self, LocalVoiceGateConfigError> {
-        let config = config.validate()?;
         Ok(Self {
-            splitter: FixedFrameSplitter::new(FRAME_SAMPLES)?,
-            config,
+            config: config.validate()?,
             state: VoiceGateState::Idle,
             pre_roll: VecDeque::new(),
             candidate_audio: Vec::new(),
             candidate_evidence: Vec::new(),
             active_audio: Vec::new(),
             trailing_silence_samples: 0,
+            next_sample: 0,
         })
     }
 
-    /// Processes variable-sized 16 kHz mono PCM chunks.
-    pub fn push_samples(&mut self, samples: &[i16]) -> Vec<ReadyBatch> {
-        let frames = self.splitter.push_samples(samples);
-        let mut batches = Vec::new();
-        for frame in frames {
-            batches.extend(self.process_frame(frame));
-        }
-        batches
+    /// Consume one chronological Silero frame. Activation uses only the 0.50
+    /// speech threshold. Once active, the 0.35 negative threshold supplies the
+    /// same neutral hysteresis band used by Silero's official iterator.
+    pub fn push_evidence(
+        &mut self,
+        frame: PcmFrame,
+        speech_probability: f32,
+    ) -> Result<Vec<ReadyBatch>, LocalVoiceGateInputError> {
+        self.validate_frame(&frame, speech_probability)?;
+        self.next_sample = self.next_sample.saturating_add(frame.valid_samples as u64);
+
+        let positive = speech_probability >= self.config.speech_threshold;
+        let classified = ClassifiedFrame {
+            frame,
+            probability: speech_probability,
+            positive,
+        };
+
+        let batches = match self.state {
+            VoiceGateState::Idle => {
+                self.process_idle(classified);
+                Vec::new()
+            }
+            VoiceGateState::Candidate => {
+                self.process_candidate(classified);
+                if self.state == VoiceGateState::Active {
+                    self.take_max_batch()
+                } else {
+                    Vec::new()
+                }
+            }
+            VoiceGateState::Active | VoiceGateState::Hangover => self.process_active(classified),
+        };
+        Ok(batches)
     }
 
-    /// Explicitly classifies the real remainder, then finalizes confirmed speech.
+    /// Finalize only previously confirmed speech. Unconfirmed candidates are
+    /// discarded, and no PCM classification occurs here.
     pub fn finish(&mut self) -> Vec<ReadyBatch> {
         let mut batches = Vec::new();
-        if let Some(frame) = self.splitter.finish() {
-            batches.extend(self.process_frame(frame));
-        }
-
         match self.state {
             VoiceGateState::Active | VoiceGateState::Hangover => {
                 if !self.active_audio.is_empty() {
@@ -354,33 +318,31 @@ impl LocalVoiceGate {
         self.state
     }
 
-    pub fn remainder_len(&self) -> usize {
-        self.splitter.remainder_len()
-    }
-
     pub fn timeline_samples(&self) -> u64 {
-        self.splitter.timeline_samples()
+        self.next_sample
     }
 
-    fn process_frame(&mut self, frame: PcmFrame) -> Vec<ReadyBatch> {
-        let positive = frame.rms() >= self.config.rms_threshold;
-        let classified = ClassifiedFrame { frame, positive };
-
-        match self.state {
-            VoiceGateState::Idle => {
-                self.process_idle(classified);
-                Vec::new()
-            }
-            VoiceGateState::Candidate => {
-                self.process_candidate(classified);
-                if self.state == VoiceGateState::Active {
-                    self.take_max_batch()
-                } else {
-                    Vec::new()
-                }
-            }
-            VoiceGateState::Active | VoiceGateState::Hangover => self.process_active(classified),
+    fn validate_frame(
+        &self,
+        frame: &PcmFrame,
+        probability: f32,
+    ) -> Result<(), LocalVoiceGateInputError> {
+        if frame.samples.is_empty() {
+            return Err(LocalVoiceGateInputError::EmptyFrame);
         }
+        if frame.valid_samples == 0 || frame.valid_samples > frame.samples.len() {
+            return Err(LocalVoiceGateInputError::InvalidValidSampleCount);
+        }
+        if !probability.is_finite() || !(0.0..=1.0).contains(&probability) {
+            return Err(LocalVoiceGateInputError::InvalidProbability);
+        }
+        if frame.start_sample != self.next_sample {
+            return Err(LocalVoiceGateInputError::DiscontinuousTimeline {
+                expected: self.next_sample,
+                actual: frame.start_sample,
+            });
+        }
+        Ok(())
     }
 
     fn process_idle(&mut self, classified: ClassifiedFrame) {
@@ -416,13 +378,19 @@ impl LocalVoiceGate {
 
     fn process_active(&mut self, classified: ClassifiedFrame) -> Vec<ReadyBatch> {
         let valid_samples = classified.frame.valid_samples;
-        let positive = classified.positive;
+        let probability = classified.probability;
         self.active_audio.push(classified);
 
-        if positive {
+        if probability >= self.config.speech_threshold {
             self.trailing_silence_samples = 0;
             self.state = VoiceGateState::Active;
-        } else {
+        } else if probability < self.config.negative_threshold {
+            self.trailing_silence_samples =
+                self.trailing_silence_samples.saturating_add(valid_samples);
+            self.state = VoiceGateState::Hangover;
+        } else if self.trailing_silence_samples > 0 {
+            // The official iterator's neutral band neither starts nor cancels a
+            // pending end; elapsed samples still advance its silence timer.
             self.trailing_silence_samples =
                 self.trailing_silence_samples.saturating_add(valid_samples);
             self.state = VoiceGateState::Hangover;
@@ -431,7 +399,6 @@ impl LocalVoiceGate {
         if self.trailing_silence_samples >= self.config.end_silence_samples {
             return self.take_endpoint_batch();
         }
-
         self.take_max_batch()
     }
 
@@ -493,6 +460,7 @@ impl LocalVoiceGate {
         self.candidate_evidence.clear();
         self.active_audio.clear();
         self.trailing_silence_samples = 0;
+        self.next_sample = 0;
     }
 }
 
@@ -500,6 +468,8 @@ impl LocalVoiceGate {
 struct FrameMeasurements {
     total_frames: usize,
     positive_frames: usize,
+    probability_sum: f64,
+    max_probability: f32,
     positive_samples: usize,
     longest_positive_run_frames: usize,
     longest_positive_run_samples: usize,
@@ -519,6 +489,8 @@ fn measure_frames(frames: &[ClassifiedFrame]) -> FrameMeasurements {
         let valid_samples = classified.frame.valid_samples;
         result.total_frames += 1;
         result.real_samples += valid_samples;
+        result.probability_sum += f64::from(classified.probability);
+        result.max_probability = result.max_probability.max(classified.probability);
 
         if classified.positive {
             result.positive_frames += 1;
@@ -543,7 +515,6 @@ fn measure_frames(frames: &[ClassifiedFrame]) -> FrameMeasurements {
                 result.longest_silence_run_samples.max(silence_run_samples);
         }
     }
-
     result
 }
 
@@ -559,6 +530,11 @@ fn make_batch(frames: Vec<ClassifiedFrame>, ends_utterance: bool) -> ReadyBatch 
     } else {
         measurements.positive_frames as f32 / measurements.total_frames as f32
     };
+    let mean_probability = if measurements.total_frames == 0 {
+        0.0
+    } else {
+        (measurements.probability_sum / measurements.total_frames as f64) as f32
+    };
 
     ReadyBatch {
         samples,
@@ -567,6 +543,8 @@ fn make_batch(frames: Vec<ClassifiedFrame>, ends_utterance: bool) -> ReadyBatch 
             total_frames: measurements.total_frames,
             positive_frames: measurements.positive_frames,
             positive_ratio,
+            mean_probability,
+            max_probability: measurements.max_probability,
             positive_samples: measurements.positive_samples,
             positive_duration_ms: duration_ms(measurements.positive_samples),
             longest_positive_run_frames: measurements.longest_positive_run_frames,
@@ -600,308 +578,244 @@ mod tests {
     use super::*;
 
     const SILENCE: i16 = 0;
-    const QUIET_NOISE: i16 = 299;
     const SPEECH: i16 = 1_000;
+    const NEGATIVE: f32 = 0.05;
+    const NEUTRAL: f32 = 0.42;
+    const POSITIVE: f32 = 0.90;
 
-    fn splitter() -> FixedFrameSplitter {
-        FixedFrameSplitter::new(FRAME_SAMPLES).expect("valid fixed frame size")
+    struct GateDriver {
+        gate: LocalVoiceGate,
+        next_sample: u64,
     }
 
-    fn gate() -> LocalVoiceGate {
-        LocalVoiceGate::new(LocalVoiceGateConfig::initial_test_hypothesis())
-            .expect("valid test hypothesis")
-    }
-
-    fn samples(value: i16, frames: usize) -> Vec<i16> {
-        vec![value; frames * FRAME_SAMPLES]
-    }
-
-    fn push_frame(gate: &mut LocalVoiceGate, value: i16) -> Vec<ReadyBatch> {
-        gate.push_samples(&samples(value, 1))
-    }
-
-    fn push_frames(gate: &mut LocalVoiceGate, value: i16, count: usize) -> Vec<ReadyBatch> {
-        gate.push_samples(&samples(value, count))
-    }
-
-    fn collect_frames(mut splitter: FixedFrameSplitter, chunks: &[&[i16]]) -> Vec<PcmFrame> {
-        let mut frames = Vec::new();
-        for chunk in chunks {
-            frames.extend(splitter.push_samples(chunk));
+    impl GateDriver {
+        fn new() -> Self {
+            Self {
+                gate: LocalVoiceGate::new(LocalVoiceGateConfig::initial_test_hypothesis())
+                    .expect("valid test hypothesis"),
+                next_sample: 0,
+            }
         }
-        if let Some(frame) = splitter.finish() {
-            frames.push(frame);
+
+        fn with_config(config: LocalVoiceGateConfig) -> Self {
+            Self {
+                gate: LocalVoiceGate::new(config).expect("valid test config"),
+                next_sample: 0,
+            }
         }
-        frames
+
+        fn push(&mut self, sample: i16, probability: f32) -> Vec<ReadyBatch> {
+            let frame = PcmFrame {
+                samples: vec![sample; FRAME_SAMPLES],
+                valid_samples: FRAME_SAMPLES,
+                start_sample: self.next_sample,
+            };
+            self.next_sample += FRAME_SAMPLES as u64;
+            self.gate
+                .push_evidence(frame, probability)
+                .expect("valid deterministic evidence")
+        }
+
+        fn push_many(&mut self, sample: i16, probability: f32, count: usize) -> Vec<ReadyBatch> {
+            let mut batches = Vec::new();
+            for _ in 0..count {
+                batches.extend(self.push(sample, probability));
+            }
+            batches
+        }
     }
 
     #[test]
-    fn one_sample_becomes_explicit_remainder() {
-        let mut splitter = splitter();
-        assert!(splitter.push_samples(&[7]).is_empty());
-        assert_eq!(splitter.remainder_len(), 1);
-        let frame = splitter.finish().expect("one-sample remainder");
-        assert_eq!(frame.samples, vec![7]);
-        assert_eq!(frame.valid_samples, 1);
-        assert_eq!(frame.start_sample, 0);
+    fn negative_silero_evidence_keeps_idle() {
+        let mut driver = GateDriver::new();
+        assert!(driver.push_many(SILENCE, NEGATIVE, 100).is_empty());
+        assert_eq!(driver.gate.state(), VoiceGateState::Idle);
+        assert!(driver.gate.finish().is_empty());
     }
 
     #[test]
-    fn three_hundred_nineteen_samples_remain_pending() {
-        let mut splitter = splitter();
-        assert!(splitter.push_samples(&vec![8; 319]).is_empty());
-        assert_eq!(splitter.remainder_len(), 319);
-        assert_eq!(splitter.finish().expect("partial frame").valid_samples, 319);
+    fn isolated_false_positive_does_not_confirm_candidate() {
+        let mut driver = GateDriver::new();
+        driver.push(SPEECH, POSITIVE);
+        assert_eq!(driver.gate.state(), VoiceGateState::Candidate);
+        assert!(driver.push_many(SILENCE, NEGATIVE, 4).is_empty());
+        assert_eq!(driver.gate.state(), VoiceGateState::Idle);
+        assert!(driver.gate.finish().is_empty());
     }
 
     #[test]
-    fn three_hundred_twenty_samples_form_one_frame() {
-        let mut splitter = splitter();
-        let frames = splitter.push_samples(&vec![9; 320]);
-        assert_eq!(frames.len(), 1);
-        assert_eq!(frames[0].valid_samples, 320);
-        assert_eq!(frames[0].start_sample, 0);
-        assert_eq!(splitter.remainder_len(), 0);
-    }
-
-    #[test]
-    fn three_hundred_twenty_one_samples_leave_one_sample() {
-        let mut splitter = splitter();
-        let frames = splitter.push_samples(&vec![10; 321]);
-        assert_eq!(frames.len(), 1);
-        assert_eq!(splitter.remainder_len(), 1);
-        let remainder = splitter.finish().expect("one remaining sample");
-        assert_eq!(remainder.valid_samples, 1);
-        assert_eq!(remainder.start_sample, 320);
-    }
-
-    #[test]
-    fn multiple_chunks_form_exactly_one_frame() {
-        let first = vec![1; 100];
-        let second = vec![2; 100];
-        let third = vec![3; 120];
-        let frames = collect_frames(splitter(), &[&first, &second, &third]);
-        assert_eq!(frames.len(), 1);
-        assert_eq!(frames[0].valid_samples, FRAME_SAMPLES);
-        assert_eq!(&frames[0].samples[..100], first.as_slice());
-        assert_eq!(&frames[0].samples[100..200], second.as_slice());
-        assert_eq!(&frames[0].samples[200..], third.as_slice());
-    }
-
-    #[test]
-    fn one_chunk_produces_multiple_frames() {
-        let mut splitter = splitter();
-        let frames = splitter.push_samples(&vec![4; FRAME_SAMPLES * 3]);
-        assert_eq!(frames.len(), 3);
-        assert!(frames
-            .iter()
-            .all(|frame| frame.valid_samples == FRAME_SAMPLES));
-        assert_eq!(frames[2].start_sample, (FRAME_SAMPLES * 2) as u64);
-    }
-
-    #[test]
-    fn splitter_loses_no_samples() {
-        let input: Vec<i16> = (0..1_003).map(|value| value as i16).collect();
-        let chunks = [&input[..1], &input[1..320], &input[320..777], &input[777..]];
-        let frames = collect_frames(splitter(), &chunks);
-        let output_len: usize = frames.iter().map(|frame| frame.valid_samples).sum();
-        assert_eq!(output_len, input.len());
-    }
-
-    #[test]
-    fn splitter_duplicates_no_samples() {
-        let input: Vec<i16> = (0..1_003).map(|value| value as i16).collect();
-        let chunks = [
-            &input[..17],
-            &input[17..500],
-            &input[500..999],
-            &input[999..],
-        ];
-        let frames = collect_frames(splitter(), &chunks);
-        let output: Vec<i16> = frames.into_iter().flat_map(|frame| frame.samples).collect();
-        assert_eq!(output, input);
-    }
-
-    #[test]
-    fn remainder_rms_uses_only_valid_samples() {
-        let mut splitter = splitter();
-        splitter.push_samples(&[1_000]);
-        let frame = splitter.finish().expect("one real sample");
-        assert_eq!(frame.valid_samples, 1);
-        assert_eq!(frame.samples.len(), 1);
-        assert!((frame.rms() - 1_000.0).abs() < f32::EPSILON);
-    }
-
-    #[test]
-    fn absolute_silence_produces_no_batch() {
-        let mut gate = gate();
-        assert!(push_frames(&mut gate, SILENCE, 100).is_empty());
-        assert!(gate.finish().is_empty());
-    }
-
-    #[test]
-    fn noise_below_threshold_produces_no_batch() {
-        let mut gate = gate();
-        assert!(push_frames(&mut gate, QUIET_NOISE, 100).is_empty());
-        assert!(gate.finish().is_empty());
-    }
-
-    #[test]
-    fn one_positive_impulse_does_not_activate() {
-        let mut gate = gate();
-        assert!(push_frame(&mut gate, SPEECH).is_empty());
-        assert!(push_frames(&mut gate, SILENCE, 9).is_empty());
-        assert_eq!(gate.state(), VoiceGateState::Idle);
-        assert!(gate.finish().is_empty());
-    }
-
-    #[test]
-    fn two_separated_impulses_do_not_activate() {
-        let mut gate = gate();
-        push_frame(&mut gate, SPEECH);
-        push_frame(&mut gate, SILENCE);
-        push_frame(&mut gate, SPEECH);
-        assert!(push_frames(&mut gate, SILENCE, 7).is_empty());
-        assert_eq!(gate.state(), VoiceGateState::Idle);
-        assert!(gate.finish().is_empty());
-    }
-
-    #[test]
-    fn rejected_candidate_returns_to_idle() {
-        let mut gate = gate();
-        push_frame(&mut gate, SPEECH);
-        assert_eq!(gate.state(), VoiceGateState::Candidate);
-        push_frames(&mut gate, SILENCE, 9);
-        assert_eq!(gate.state(), VoiceGateState::Idle);
-    }
-
-    #[test]
-    fn confirmed_short_speech_includes_pre_roll() {
-        let mut gate = gate();
-        push_frames(&mut gate, SILENCE, 15);
-        push_frames(&mut gate, SPEECH, 3);
-        let batches = push_frames(&mut gate, SILENCE, 35);
+    fn confirmed_short_speech_produces_ready_batch() {
+        let mut driver = GateDriver::new();
+        driver.push_many(SPEECH, POSITIVE, 2);
+        let batches = driver.gate.finish();
         assert_eq!(batches.len(), 1);
-        let batch = &batches[0];
-        assert!(batch.ends_utterance);
-        assert_eq!(batch.samples.len(), (15 + 3 + 10) * FRAME_SAMPLES);
-        assert!(batch.samples[..15 * FRAME_SAMPLES]
+        assert!(batches[0].ends_utterance);
+        assert_eq!(batches[0].samples.len(), 2 * FRAME_SAMPLES);
+    }
+
+    #[test]
+    fn pre_roll_is_preserved() {
+        let mut driver = GateDriver::new();
+        driver.push_many(SILENCE, NEGATIVE, 10);
+        driver.push_many(SPEECH, POSITIVE, 2);
+        let batch = driver.gate.finish().pop().expect("confirmed batch");
+        assert_eq!(batch.samples.len(), 12 * FRAME_SAMPLES);
+        assert!(batch.samples[..10 * FRAME_SAMPLES]
             .iter()
             .all(|sample| *sample == SILENCE));
     }
 
     #[test]
-    fn internal_negative_frames_remain_in_active_audio() {
-        let mut gate = gate();
-        push_frames(&mut gate, SPEECH, 3);
-        push_frames(&mut gate, SILENCE, 2);
-        push_frame(&mut gate, SPEECH);
-        let batches = gate.finish();
-        assert_eq!(batches.len(), 1);
-        let internal = &batches[0].samples[3 * FRAME_SAMPLES..5 * FRAME_SAMPLES];
+    fn internal_pauses_are_preserved() {
+        let mut driver = GateDriver::new();
+        driver.push_many(SPEECH, POSITIVE, 2);
+        driver.push_many(SILENCE, NEGATIVE, 2);
+        driver.push(SPEECH, POSITIVE);
+        let batch = driver.gate.finish().pop().expect("confirmed batch");
+        let internal = &batch.samples[2 * FRAME_SAMPLES..4 * FRAME_SAMPLES];
         assert!(internal.iter().all(|sample| *sample == SILENCE));
     }
 
     #[test]
-    fn speech_resumption_during_hangover_cancels_endpoint() {
-        let mut gate = gate();
-        push_frames(&mut gate, SPEECH, 3);
-        push_frames(&mut gate, SILENCE, 20);
-        assert_eq!(gate.state(), VoiceGateState::Hangover);
-        push_frame(&mut gate, SPEECH);
-        assert_eq!(gate.state(), VoiceGateState::Active);
-        assert!(push_frames(&mut gate, SILENCE, 34).is_empty());
-        assert_eq!(gate.state(), VoiceGateState::Hangover);
-        assert_eq!(push_frame(&mut gate, SILENCE).len(), 1);
-        assert_eq!(gate.state(), VoiceGateState::Idle);
+    fn resumption_during_hangover_cancels_endpoint() {
+        let mut driver = GateDriver::new();
+        driver.push_many(SPEECH, POSITIVE, 2);
+        driver.push_many(SILENCE, NEGATIVE, 10);
+        assert_eq!(driver.gate.state(), VoiceGateState::Hangover);
+        driver.push(SPEECH, POSITIVE);
+        assert_eq!(driver.gate.state(), VoiceGateState::Active);
+        assert!(driver.push_many(SILENCE, NEGATIVE, 21).is_empty());
+        assert_eq!(driver.push(SILENCE, NEGATIVE).len(), 1);
     }
 
     #[test]
-    fn seven_hundred_ms_of_silence_produces_endpoint() {
-        let mut gate = gate();
-        push_frames(&mut gate, SPEECH, 3);
-        assert!(push_frames(&mut gate, SILENCE, 34).is_empty());
-        let batches = push_frame(&mut gate, SILENCE);
+    fn hysteresis_band_does_not_start_hangover_but_preserves_pending_end() {
+        let mut driver = GateDriver::new();
+        driver.push_many(SPEECH, POSITIVE, 2);
+        driver.push_many(SPEECH, NEUTRAL, 5);
+        assert_eq!(driver.gate.state(), VoiceGateState::Active);
+
+        driver.push(SILENCE, NEGATIVE);
+        assert_eq!(driver.gate.state(), VoiceGateState::Hangover);
+        driver.push_many(SILENCE, NEUTRAL, 20);
+        assert_eq!(driver.gate.state(), VoiceGateState::Hangover);
+        assert_eq!(driver.push(SILENCE, NEUTRAL).len(), 1);
+    }
+
+    #[test]
+    fn endpoint_sets_ends_utterance_and_keeps_exact_post_roll() {
+        let mut driver = GateDriver::new();
+        driver.push_many(SPEECH, POSITIVE, 2);
+        let batches = driver.push_many(SILENCE, NEGATIVE, 22);
         assert_eq!(batches.len(), 1);
         assert!(batches[0].ends_utterance);
-        assert_eq!(gate.state(), VoiceGateState::Idle);
+        assert_eq!(batches[0].samples.len(), 8 * FRAME_SAMPLES);
+        assert!(batches[0].samples[2 * FRAME_SAMPLES..]
+            .iter()
+            .all(|sample| *sample == SILENCE));
     }
 
     #[test]
-    fn endpoint_preserves_exact_post_roll() {
-        let mut gate = gate();
-        push_frames(&mut gate, SPEECH, 3);
-        let batches = push_frames(&mut gate, SILENCE, 35);
-        let batch = &batches[0];
-        assert_eq!(batch.samples.len(), 13 * FRAME_SAMPLES);
-        let post_roll = &batch.samples[3 * FRAME_SAMPLES..];
-        assert_eq!(post_roll.len(), 10 * FRAME_SAMPLES);
-        assert!(post_roll.iter().all(|sample| *sample == SILENCE));
-    }
-
-    #[test]
-    fn continuous_speech_produces_non_ending_max_batch() {
-        let mut gate = gate();
-        let batches = push_frames(&mut gate, SPEECH, 250);
+    fn maximum_batch_does_not_end_utterance() {
+        let mut config = LocalVoiceGateConfig::initial_test_hypothesis();
+        config.max_batch_ms = 320;
+        let mut driver = GateDriver::with_config(config);
+        let batches = driver.push_many(SPEECH, POSITIVE, 10);
         assert_eq!(batches.len(), 1);
         assert!(!batches[0].ends_utterance);
-        assert_eq!(batches[0].samples.len(), 5 * SAMPLE_RATE_HZ as usize);
-        assert_eq!(gate.state(), VoiceGateState::Active);
+        assert_eq!(batches[0].samples.len(), 10 * FRAME_SAMPLES);
+        assert_eq!(driver.gate.state(), VoiceGateState::Active);
     }
 
     #[test]
-    fn finish_emits_confirmed_residual_shorter_than_half_second() {
-        let mut gate = gate();
-        push_frames(&mut gate, SPEECH, 3);
-        let batches = gate.finish();
-        assert_eq!(batches.len(), 1);
-        assert!(batches[0].ends_utterance);
+    fn finish_sends_active_short_speech_and_discards_candidate() {
+        let mut active = GateDriver::new();
+        active.push_many(SPEECH, POSITIVE, 2);
+        assert_eq!(active.gate.finish().len(), 1);
+
+        let mut candidate = GateDriver::new();
+        candidate.push(SPEECH, POSITIVE);
+        assert!(candidate.gate.finish().is_empty());
+        assert_eq!(candidate.gate.state(), VoiceGateState::Idle);
+    }
+
+    #[test]
+    fn no_sample_is_lost_or_duplicated() {
+        let mut driver = GateDriver::new();
+        let pattern = [
+            (11, POSITIVE),
+            (22, POSITIVE),
+            (33, NEGATIVE),
+            (44, POSITIVE),
+        ];
+        for (sample, probability) in pattern {
+            driver.push(sample, probability);
+        }
         assert_eq!(
-            batches[0].samples.len(),
-            60 * SAMPLE_RATE_HZ as usize / 1_000
+            driver.gate.timeline_samples(),
+            (pattern.len() * FRAME_SAMPLES) as u64
         );
+        let batch = driver.gate.finish().pop().expect("confirmed batch");
+        let expected = pattern
+            .into_iter()
+            .flat_map(|(sample, _)| vec![sample; FRAME_SAMPLES])
+            .collect::<Vec<_>>();
+        assert_eq!(batch.samples, expected);
+        assert_eq!(driver.gate.timeline_samples(), 0);
     }
 
     #[test]
-    fn finish_discards_unconfirmed_candidate() {
-        let mut gate = gate();
-        push_frame(&mut gate, SPEECH);
-        assert_eq!(gate.state(), VoiceGateState::Candidate);
-        assert!(gate.finish().is_empty());
-        assert_eq!(gate.state(), VoiceGateState::Idle);
+    fn discontinuous_timeline_is_rejected_without_advancing() {
+        let mut gate =
+            LocalVoiceGate::new(LocalVoiceGateConfig::initial_test_hypothesis()).unwrap();
+        let error = gate
+            .push_evidence(
+                PcmFrame {
+                    samples: vec![0; FRAME_SAMPLES],
+                    valid_samples: FRAME_SAMPLES,
+                    start_sample: 10,
+                },
+                NEGATIVE,
+            )
+            .unwrap_err();
+        assert_eq!(
+            error,
+            LocalVoiceGateInputError::DiscontinuousTimeline {
+                expected: 0,
+                actual: 10
+            }
+        );
+        assert_eq!(gate.timeline_samples(), 0);
     }
 
     #[test]
-    fn known_temporal_pattern_has_exact_metrics() {
-        let mut gate = gate();
-        push_frames(&mut gate, SPEECH, 3);
-        push_frames(&mut gate, SILENCE, 2);
-        push_frame(&mut gate, SPEECH);
-        push_frames(&mut gate, SILENCE, 3);
-        let batches = gate.finish();
-        let metrics = &batches[0].metrics;
-        assert_eq!(metrics.total_frames, 9);
-        assert_eq!(metrics.positive_frames, 4);
-        assert!((metrics.positive_ratio - 4.0 / 9.0).abs() < f32::EPSILON);
-        assert_eq!(metrics.positive_samples, 4 * FRAME_SAMPLES);
-        assert_eq!(metrics.positive_duration_ms, 80.0);
-        assert_eq!(metrics.longest_positive_run_frames, 3);
-        assert_eq!(metrics.longest_positive_run_ms, 60.0);
-        assert_eq!(metrics.longest_silence_run_frames, 3);
-        assert_eq!(metrics.longest_silence_run_ms, 60.0);
-        assert_eq!(metrics.real_samples, 9 * FRAME_SAMPLES);
-        assert_eq!(metrics.total_duration_ms, 180.0);
+    fn metrics_report_silero_probabilities_and_runs() {
+        let mut driver = GateDriver::new();
+        driver.push(SPEECH, 0.8);
+        driver.push(SPEECH, 0.6);
+        driver.push(SILENCE, 0.2);
+        driver.push(SPEECH, 0.7);
+        let batch = driver.gate.finish().pop().expect("confirmed batch");
+        assert_eq!(batch.metrics.total_frames, 4);
+        assert_eq!(batch.metrics.positive_frames, 3);
+        assert!((batch.metrics.positive_ratio - 0.75).abs() < f32::EPSILON);
+        assert!((batch.metrics.mean_probability - 0.575).abs() < 0.000_1);
+        assert!((batch.metrics.max_probability - 0.8).abs() < f32::EPSILON);
+        assert_eq!(batch.metrics.longest_positive_run_frames, 2);
+        assert_eq!(batch.metrics.longest_silence_run_frames, 1);
+        assert_eq!(batch.metrics.real_samples, 4 * FRAME_SAMPLES);
+        assert_eq!(batch.metrics.total_duration_ms, 128.0);
     }
 
     #[test]
     fn gate_instances_do_not_share_state() {
-        let mut first = gate();
-        let mut second = gate();
-        push_frames(&mut first, SPEECH, 3);
-        push_frame(&mut second, SPEECH);
-        assert_eq!(first.state(), VoiceGateState::Active);
-        assert_eq!(second.state(), VoiceGateState::Candidate);
-        assert_eq!(first.finish().len(), 1);
-        assert!(second.finish().is_empty());
+        let mut first = GateDriver::new();
+        let mut second = GateDriver::new();
+        first.push_many(SPEECH, POSITIVE, 2);
+        second.push(SPEECH, POSITIVE);
+        assert_eq!(first.gate.state(), VoiceGateState::Active);
+        assert_eq!(second.gate.state(), VoiceGateState::Candidate);
+        assert_eq!(first.gate.finish().len(), 1);
+        assert!(second.gate.finish().is_empty());
     }
 }

@@ -36,7 +36,12 @@ use crate::stt::local_voice_gate::{
     LocalVoiceGate, LocalVoiceGateConfig, ReadyBatch, VoiceBatchMetrics, VoiceGateState,
     FRAME_DURATION_MS,
 };
+#[cfg(test)]
+use crate::stt::local_voice_gate::{PcmFrame, FRAME_SAMPLES};
 use crate::stt::provider::{STTProvider, STTProviderType, TranscriptResult};
+use crate::stt::silero_vad::{
+    SileroVadClassifier, SileroVadFrame, SILERO_VAD_SHA256, SILERO_VAD_VERSION,
+};
 
 #[cfg(debug_assertions)]
 fn transcript_diag_ts_ms() -> u128 {
@@ -242,6 +247,9 @@ pub struct GroqWhisperSTT {
     /// Per-stream acoustic gate. It is created on start and discarded on stop,
     /// so no candidate, pre-roll, or utterance state survives between captures.
     voice_gate: Option<LocalVoiceGate>,
+    /// Per-stream Silero ONNX session and recurrent state. This is separate
+    /// from endpointing and never transcribes audio.
+    voice_classifier: Option<SileroVadClassifier>,
     /// Segment counter for diagnostics.
     segment_counter: u64,
     /// Chunks fed since stream start (for periodic diagnostics).
@@ -274,6 +282,7 @@ impl GroqWhisperSTT {
             stop_flag: Arc::new(AtomicBool::new(false)),
             start_time: None,
             voice_gate: None,
+            voice_classifier: None,
             segment_counter: 0,
             chunks_fed: 0,
             app_handle: None,
@@ -359,6 +368,25 @@ impl GroqWhisperSTT {
             .map_err(|error| format!("Local voice gate configuration failed: {error}"))
     }
 
+    fn push_vad_frames(
+        &mut self,
+        frames: Vec<SileroVadFrame>,
+    ) -> Result<(VoiceGateState, VoiceGateState, Vec<ReadyBatch>), String> {
+        let gate = self
+            .voice_gate
+            .as_mut()
+            .ok_or_else(|| "Local voice gate is not initialized".to_string())?;
+        let previous_state = gate.state();
+        let mut ready_batches = Vec::new();
+        for frame in frames {
+            ready_batches.extend(
+                gate.push_evidence(frame.pcm, frame.speech_probability)
+                    .map_err(|error| format!("Local voice evidence was rejected: {error}"))?,
+            );
+        }
+        Ok((previous_state, gate.state(), ready_batches))
+    }
+
     fn ready_batch_job(
         ready_batch: ReadyBatch,
         config: GroqConfig,
@@ -407,7 +435,7 @@ impl GroqWhisperSTT {
         job.sequence = sequence;
 
         transcript_diag!(
-            "event=batch_enqueued sequence={} party={} requestType={} gateReason={} endsUtterance={} audioDurationSecs={:.3} rms={:.1} totalFrames={} positiveFrames={} positiveRatio={:.3} longestPositiveRunFrames={} queueCapacity={}",
+            "event=batch_enqueued sequence={} party={} requestType={} gateReason={} gateDecision=silero_confirmed endsUtterance={} audioDurationSecs={:.3} rms={:.1} sileroFrames={} meanProbability={:.4} maxProbability={:.4} framesAboveThreshold={} positiveRatio={:.3} longestPositiveRunFrames={} queueCapacity={}",
             job.sequence,
             self.party,
             job.request_type.as_str(),
@@ -416,6 +444,8 @@ impl GroqWhisperSTT {
             job.audio_duration_secs,
             job.rms,
             job.gate_metrics.total_frames,
+            job.gate_metrics.mean_probability,
+            job.gate_metrics.max_probability,
             job.gate_metrics.positive_frames,
             job.gate_metrics.positive_ratio,
             job.gate_metrics.longest_positive_run_frames,
@@ -680,7 +710,7 @@ impl GroqWhisperSTT {
             let request_type_name = request_type.as_str();
 
             transcript_diag!(
-                "event=request_started sequence={} party={} requestType={} gateReason={} endsUtterance={} audioDurationSecs={:.3} rms={:.1} totalFrames={} positiveFrames={} positiveRatio={:.3}",
+                "event=request_started sequence={} party={} requestType={} gateReason={} gateDecision=silero_confirmed endsUtterance={} audioDurationSecs={:.3} rms={:.1} sileroFrames={} meanProbability={:.4} maxProbability={:.4} framesAboveThreshold={} positiveRatio={:.3} longestPositiveRunFrames={}",
                 sequence,
                 party,
                 request_type_name,
@@ -689,8 +719,11 @@ impl GroqWhisperSTT {
                 audio_duration_secs,
                 rms,
                 gate_metrics.total_frames,
+                gate_metrics.mean_probability,
+                gate_metrics.max_probability,
                 gate_metrics.positive_frames,
-                gate_metrics.positive_ratio
+                gate_metrics.positive_ratio,
+                gate_metrics.longest_positive_run_frames
             );
 
             // Every gate-approved batch still crosses the secondary RMS defense
@@ -807,6 +840,9 @@ impl STTProvider for GroqWhisperSTT {
         let config = self.current_config();
         let gate_config = Self::voice_gate_config(&config)?;
         let voice_gate = Self::create_voice_gate(&config)?;
+        let classifier_started = Instant::now();
+        let voice_classifier = SileroVadClassifier::from_embedded_model()?;
+        let classifier_init_ms = classifier_started.elapsed().as_secs_f64() * 1_000.0;
         self.emit_debug(
             "info",
             &format!(
@@ -978,18 +1014,28 @@ impl STTProvider for GroqWhisperSTT {
         self.stop_flag.store(false, Ordering::SeqCst);
         self.start_time = Some(Instant::now());
         self.voice_gate = Some(voice_gate);
+        self.voice_classifier = Some(voice_classifier);
         self.segment_counter = 0;
         self.chunks_fed = 0;
         self.next_batch_sequence = 0;
 
         transcript_diag!(
-            "event=voice_gate_created party={} state=idle maxBatchMs={} hypothesis=initial_test",
+            "event=voice_gate_created party={} classifier=silero version={} modelSha256={} state=idle speechThreshold={:.2} negativeThreshold={:.2} minConsecutiveFrames={} preRollMs={} endpointMs={} postRollMs={} maxBatchMs={} initMs={:.3}",
             self.party,
-            gate_config.max_batch_ms
+            SILERO_VAD_VERSION,
+            SILERO_VAD_SHA256,
+            gate_config.speech_threshold,
+            gate_config.negative_threshold,
+            gate_config.min_consecutive_positive_frames,
+            gate_config.pre_roll_ms,
+            gate_config.end_silence_ms,
+            gate_config.post_roll_ms,
+            gate_config.max_batch_ms,
+            classifier_init_ms
         );
         self.emit_debug(
             "info",
-            "Stream started: local voice gate is selecting Groq batches",
+            "Stream started: Silero VAD is selecting local voice evidence for Groq batches",
         );
         Ok(())
     }
@@ -1010,12 +1056,17 @@ impl STTProvider for GroqWhisperSTT {
         }
         if self.chunks_fed % 500 == 0 {
             if let Some(gate) = self.voice_gate.as_ref() {
+                let pending_samples = self
+                    .voice_classifier
+                    .as_ref()
+                    .map(SileroVadClassifier::remainder_len)
+                    .unwrap_or_default();
                 self.emit_debug(
                     "info",
                     &format!(
                         "Voice gate: state={:?}, pendingSamples={}, chunksFed={}",
                         gate.state(),
-                        gate.remainder_len(),
+                        pending_samples,
                         self.chunks_fed
                     ),
                 );
@@ -1023,20 +1074,19 @@ impl STTProvider for GroqWhisperSTT {
         }
 
         let received_samples = chunk.pcm_data.len();
-        let (previous_state, new_state, pending_samples, ready_batches) = {
-            let gate = self
-                .voice_gate
-                .as_mut()
-                .ok_or("Local voice gate is not initialized")?;
-            let previous_state = gate.state();
-            let ready_batches = gate.push_samples(&chunk.pcm_data);
-            (
-                previous_state,
-                gate.state(),
-                gate.remainder_len(),
-                ready_batches,
-            )
-        };
+        let frames = self
+            .voice_classifier
+            .as_mut()
+            .ok_or("Silero VAD classifier is not initialized")?
+            .push_samples(&chunk.pcm_data)?;
+        let pending_samples = self
+            .voice_classifier
+            .as_ref()
+            .map(SileroVadClassifier::remainder_len)
+            .unwrap_or_default();
+        let (previous_state, new_state, ready_batches) = self
+            .push_vad_frames(frames)
+            .map_err(|error| -> Box<dyn std::error::Error + Send + Sync> { error.into() })?;
 
         if previous_state != new_state {
             let reason = match (previous_state, new_state) {
@@ -1044,7 +1094,9 @@ impl STTProvider for GroqWhisperSTT {
                 (VoiceGateState::Candidate, VoiceGateState::Active) => "activation",
                 (VoiceGateState::Active, VoiceGateState::Hangover) => "hangover",
                 (VoiceGateState::Hangover, VoiceGateState::Active) => "resumption",
-                (_, VoiceGateState::Idle) => "endpoint_or_rejection",
+                (VoiceGateState::Candidate, VoiceGateState::Idle) => "candidate_rejected",
+                (VoiceGateState::Hangover, VoiceGateState::Idle) => "endpoint",
+                (_, VoiceGateState::Idle) => "returned_to_idle",
                 _ => "state_transition",
             };
             transcript_diag!(
@@ -1110,27 +1162,54 @@ impl STTProvider for GroqWhisperSTT {
 
         let mut first_error = None;
 
-        // Finalize the same gate that accepted every stream sample. Confirmed
-        // speech residuals are queued regardless of duration; candidates that
-        // never activated are discarded by LocalVoiceGate::finish.
-        let final_batches = match self.voice_gate.take() {
+        // Classify the real final remainder first, using the official zero-pad
+        // behavior, then finalize the same endpointing state that accepted all
+        // prior frames. Candidates that never activated remain discarded.
+        let final_frames = match self.voice_classifier.take() {
+            Some(mut classifier) => match classifier.finish() {
+                Ok(frames) => frames,
+                Err(error) => {
+                    first_error = Some(error.to_string());
+                    Vec::new()
+                }
+            },
+            None => {
+                first_error = Some("Silero VAD classifier was unavailable during shutdown".into());
+                Vec::new()
+            }
+        };
+        let previous_state = self
+            .voice_gate
+            .as_ref()
+            .map(LocalVoiceGate::state)
+            .unwrap_or(VoiceGateState::Idle);
+        let mut final_batches = match self.push_vad_frames(final_frames) {
+            Ok((_, _, batches)) => batches,
+            Err(error) => {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+                Vec::new()
+            }
+        };
+        match self.voice_gate.take() {
             Some(mut gate) => {
-                let previous_state = gate.state();
-                let batches = gate.finish();
+                final_batches.extend(gate.finish());
                 transcript_diag!(
                     "event=voice_gate_finished party={} previousState={:?} newState={:?} batchesProduced={}",
                     self.party,
                     previous_state,
                     gate.state(),
-                    batches.len()
+                    final_batches.len()
                 );
-                batches
             }
             None => {
-                first_error = Some("Local voice gate was unavailable during shutdown".to_string());
-                Vec::new()
+                if first_error.is_none() {
+                    first_error =
+                        Some("Local voice gate was unavailable during shutdown".to_string());
+                }
             }
-        };
+        }
         let timestamp_ms = self
             .start_time
             .map(|start| start.elapsed().as_millis() as u64)
@@ -1375,6 +1454,8 @@ mod tests {
             } else {
                 positive_frames as f32 / total_frames as f32
             },
+            mean_probability: if positive_frames == 0 { 0.0 } else { 0.9 },
+            max_probability: if positive_frames == 0 { 0.0 } else { 0.9 },
             positive_samples: real_samples,
             positive_duration_ms: real_samples as f64 * 1_000.0 / SAMPLE_RATE as f64,
             longest_positive_run_frames: positive_frames,
@@ -1411,10 +1492,6 @@ mod tests {
         }
     }
 
-    fn audio_chunk(samples: usize, timestamp_ms: u64) -> AudioChunk {
-        pcm_chunk(vec![1_000; samples], timestamp_ms, false)
-    }
-
     fn pcm_chunk(pcm_data: Vec<i16>, timestamp_ms: u64, is_speech: bool) -> AudioChunk {
         AudioChunk {
             pcm_data,
@@ -1426,6 +1503,50 @@ mod tests {
 
     fn pcm_frames(value: i16, frames: usize) -> Vec<i16> {
         vec![value; frames * crate::stt::local_voice_gate::FRAME_SAMPLES]
+    }
+
+    fn speech_fixture_pcm() -> Vec<i16> {
+        let bytes = include_bytes!("fixtures/silero-vad/pt-BR-sim.wav");
+        let reader = hound::WavReader::new(std::io::Cursor::new(bytes))
+            .expect("generated speech fixture must be valid WAV");
+        let spec = reader.spec();
+        assert_eq!(spec.channels, 1);
+        assert_eq!(spec.sample_rate, SAMPLE_RATE);
+        assert_eq!(spec.bits_per_sample, 16);
+        reader
+            .into_samples::<i16>()
+            .collect::<Result<Vec<_>, _>>()
+            .expect("generated speech fixture PCM")
+    }
+
+    fn deterministic_noise(sample_count: usize, amplitude: i16) -> Vec<i16> {
+        let mut state = 0x5eed_1234_u32;
+        (0..sample_count)
+            .map(|_| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let centered = ((state >> 16) as i32 - 32_768) as f32 / 32_768.0;
+                (centered * f32::from(amplitude)) as i16
+            })
+            .collect()
+    }
+
+    fn tone(sample_count: usize, frequency_hz: f32, amplitude: f32) -> Vec<i16> {
+        (0..sample_count)
+            .map(|index| {
+                let phase =
+                    std::f32::consts::TAU * frequency_hz * index as f32 / SAMPLE_RATE as f32;
+                (phase.sin() * amplitude) as i16
+            })
+            .collect()
+    }
+
+    fn windows_style_chime() -> Vec<i16> {
+        let tone_samples = SAMPLE_RATE as usize / 8;
+        let gap_samples = SAMPLE_RATE as usize / 20;
+        let mut samples = tone(tone_samples, 880.0, 10_000.0);
+        samples.extend(vec![0; gap_samples]);
+        samples.extend(tone(tone_samples, 1_320.0, 10_000.0));
+        samples
     }
 
     fn controlled_processor(
@@ -1490,6 +1611,61 @@ mod tests {
         (provider, processor, result_rx)
     }
 
+    async fn feed_evidence(
+        provider: &mut GroqWhisperSTT,
+        evidence: &[(i16, f32)],
+        timestamp_ms: u64,
+    ) {
+        let start_sample = provider
+            .voice_gate
+            .as_ref()
+            .expect("voice gate")
+            .timeline_samples();
+        let frames = evidence
+            .iter()
+            .enumerate()
+            .map(|(index, &(sample, speech_probability))| SileroVadFrame {
+                pcm: PcmFrame {
+                    samples: vec![sample; FRAME_SAMPLES],
+                    valid_samples: FRAME_SAMPLES,
+                    start_sample: start_sample + (index * FRAME_SAMPLES) as u64,
+                },
+                speech_probability,
+            })
+            .collect();
+        let (_, _, ready_batches) = provider
+            .push_vad_frames(frames)
+            .expect("deterministic gate evidence");
+        for ready_batch in ready_batches {
+            provider.segment_counter += 1;
+            let gate_reason = if ready_batch.ends_utterance {
+                VoiceBatchReason::Endpoint
+            } else {
+                VoiceBatchReason::MaxDuration
+            };
+            let job = GroqWhisperSTT::ready_batch_job(
+                ready_batch,
+                provider.current_config(),
+                GroqRequestType::Normal,
+                gate_reason,
+                timestamp_ms,
+            );
+            provider.enqueue_batch(job).await.unwrap();
+        }
+    }
+
+    async fn feed_probabilities(
+        provider: &mut GroqWhisperSTT,
+        probabilities: &[f32],
+        timestamp_ms: u64,
+    ) {
+        let evidence = probabilities
+            .iter()
+            .map(|&probability| (1_000, probability))
+            .collect::<Vec<_>>();
+        feed_evidence(provider, &evidence, timestamp_ms).await;
+    }
+
     async fn assert_signal_makes_no_request(pcm_data: Vec<i16>, is_speech: bool) {
         let (mut provider, processor, mut result_rx) = recording_provider(5.0).await;
         provider
@@ -1547,43 +1723,56 @@ mod tests {
             GroqWhisperSTT::voice_gate_config(&config)
                 .unwrap()
                 .max_batch_ms,
-            2_500
+            2_496
         );
     }
 
     #[tokio::test]
-    async fn local_gate_blocks_silence_noise_impulses_and_unconfirmed_candidates() {
+    async fn silero_blocks_silence_noise_impulse_tone_chime_and_unconfirmed_candidate() {
         assert_signal_makes_no_request(pcm_frames(0, 150), true).await;
-        assert_signal_makes_no_request(pcm_frames(299, 100), true).await;
+        assert_signal_makes_no_request(deterministic_noise(FRAME_SAMPLES * 100, 100), true).await;
 
-        let mut isolated_impulse = pcm_frames(1_000, 1);
-        isolated_impulse.extend(pcm_frames(0, 9));
+        let mut isolated_impulse = vec![0; FRAME_SAMPLES * 20];
+        isolated_impulse[FRAME_SAMPLES / 2] = i16::MAX;
         assert_signal_makes_no_request(isolated_impulse, false).await;
+        assert_signal_makes_no_request(tone(SAMPLE_RATE as usize, 1_000.0, 8_000.0), false).await;
+        assert_signal_makes_no_request(windows_style_chime(), false).await;
 
-        let mut separated_impulses = pcm_frames(1_000, 1);
-        separated_impulses.extend(pcm_frames(0, 1));
-        separated_impulses.extend(pcm_frames(1_000, 1));
-        separated_impulses.extend(pcm_frames(0, 7));
-        assert_signal_makes_no_request(separated_impulses, false).await;
-
-        assert_signal_makes_no_request(pcm_frames(1_000, 1), false).await;
+        let (mut provider, processor, mut result_rx) = recording_provider(5.0).await;
+        feed_probabilities(&mut provider, &[0.9], 100).await;
+        provider.stop_stream().await.unwrap();
+        assert!(processor.calls.lock().await.is_empty());
+        assert!(result_rx.recv().await.is_none());
     }
 
     #[tokio::test]
-    async fn confirmed_short_speech_is_sent_even_below_half_a_second() {
-        let (mut provider, processor, mut result_rx) = recording_provider(5.0).await;
-        let short_speech = pcm_frames(1_000, 3);
+    async fn speech_fixture_confirmed_by_silero_generates_request() {
+        let (mut provider, processor, _result_rx) = recording_provider(5.0).await;
         provider
-            .feed_audio(pcm_chunk(short_speech.clone(), 100, false))
+            .feed_audio(pcm_chunk(speech_fixture_pcm(), 100, false))
             .await
             .unwrap();
         provider.stop_stream().await.unwrap();
 
         let calls = processor.calls.lock().await.clone();
+        assert!(
+            !calls.is_empty(),
+            "Silero rejected the generated speech fixture"
+        );
+        assert_eq!(calls[0].sequence, 1);
+    }
+
+    #[tokio::test]
+    async fn confirmed_short_speech_is_sent_even_below_half_a_second() {
+        let (mut provider, processor, mut result_rx) = recording_provider(5.0).await;
+        feed_probabilities(&mut provider, &[0.9, 0.9], 100).await;
+        provider.stop_stream().await.unwrap();
+
+        let calls = processor.calls.lock().await.clone();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].sequence, 1);
-        assert_eq!(calls[0].samples, short_speech);
-        assert_eq!(calls[0].samples.len(), 960);
+        assert_eq!(calls[0].samples, pcm_frames(1_000, 2));
+        assert_eq!(calls[0].samples.len(), 1_024);
         assert!(calls[0].samples.len() < SAMPLE_RATE as usize / 2);
 
         let partial = result_rx.recv().await.unwrap();
@@ -1597,27 +1786,16 @@ mod tests {
     #[tokio::test]
     async fn gate_to_job_preserves_pre_roll_internal_silence_and_every_sample() {
         let (mut provider, processor, _result_rx) = recording_provider(5.0).await;
-        let pre_roll = pcm_frames(0, 15);
-        let confirmed = pcm_frames(1_000, 3);
+        let pre_roll = pcm_frames(0, 10);
+        let confirmed = pcm_frames(1_000, 2);
         let internal_silence = pcm_frames(0, 2);
         let resumed = pcm_frames(1_000, 1);
 
-        provider
-            .feed_audio(pcm_chunk(pre_roll.clone(), 100, true))
-            .await
-            .unwrap();
-        provider
-            .feed_audio(pcm_chunk(confirmed.clone(), 120, false))
-            .await
-            .unwrap();
-        provider
-            .feed_audio(pcm_chunk(internal_silence.clone(), 140, true))
-            .await
-            .unwrap();
-        provider
-            .feed_audio(pcm_chunk(resumed.clone(), 160, false))
-            .await
-            .unwrap();
+        let mut evidence = vec![(0, 0.05); 10];
+        evidence.extend(vec![(1_000, 0.9); 2]);
+        evidence.extend(vec![(0, 0.05); 2]);
+        evidence.push((1_000, 0.9));
+        feed_evidence(&mut provider, &evidence, 100).await;
         provider.stop_stream().await.unwrap();
 
         let mut expected = pre_roll;
@@ -1627,7 +1805,7 @@ mod tests {
         let calls = processor.calls.lock().await.clone();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].samples, expected);
-        let internal_start = 18 * crate::stt::local_voice_gate::FRAME_SAMPLES;
+        let internal_start = 12 * crate::stt::local_voice_gate::FRAME_SAMPLES;
         let internal_end = internal_start + internal_silence.len();
         assert!(calls[0].samples[internal_start..internal_end]
             .iter()
@@ -1637,15 +1815,12 @@ mod tests {
     #[tokio::test]
     async fn segment_duration_controls_max_batch_and_max_batch_does_not_end_utterance() {
         let (mut provider, processor, mut result_rx) = recording_provider(2.0).await;
-        provider
-            .feed_audio(pcm_chunk(pcm_frames(1_000, 100), 100, false))
-            .await
-            .unwrap();
+        feed_probabilities(&mut provider, &[0.9; 63], 100).await;
         provider.stop_stream().await.unwrap();
 
         let calls = processor.calls.lock().await.clone();
         assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].samples.len(), 2 * SAMPLE_RATE as usize);
+        assert_eq!(calls[0].samples.len(), 63 * FRAME_SAMPLES);
         let partial = result_rx.recv().await.unwrap();
         let final_result = result_rx.recv().await.unwrap();
         assert!(!partial.is_final);
@@ -1741,18 +1916,30 @@ mod tests {
         let (first_tx, mut first_rx) = mpsc::channel(4);
         provider.start_stream(first_tx).await.unwrap();
         provider
-            .feed_audio(pcm_chunk(pcm_frames(1_000, 1), 100, false))
+            .feed_audio(pcm_chunk(pcm_frames(0, 1), 100, false))
             .await
             .unwrap();
+        assert_eq!(
+            provider
+                .voice_classifier
+                .as_ref()
+                .expect("first classifier")
+                .timeline_samples(),
+            FRAME_SAMPLES as u64
+        );
         provider.stop_stream().await.unwrap();
         assert!(first_rx.recv().await.is_none());
 
         let (second_tx, mut second_rx) = mpsc::channel(4);
         provider.start_stream(second_tx).await.unwrap();
-        provider
-            .feed_audio(pcm_chunk(pcm_frames(1_000, 2), 200, false))
-            .await
-            .unwrap();
+        assert_eq!(
+            provider
+                .voice_classifier
+                .as_ref()
+                .expect("second classifier")
+                .timeline_samples(),
+            0
+        );
         provider.stop_stream().await.unwrap();
         assert!(second_rx.recv().await.is_none());
         assert!(processor.calls.lock().await.is_empty());
@@ -1929,10 +2116,10 @@ mod tests {
         let (result_tx, mut result_rx) = mpsc::channel(16);
         provider.start_stream(result_tx).await.unwrap();
 
-        provider.feed_audio(audio_chunk(16_000, 100)).await.unwrap();
+        feed_probabilities(&mut provider, &[0.9; 31], 100).await;
         assert_eq!(started_rx.recv().await, Some(1));
-        provider.feed_audio(audio_chunk(16_000, 200)).await.unwrap();
-        provider.feed_audio(audio_chunk(8_000, 300)).await.unwrap();
+        feed_probabilities(&mut provider, &[0.9; 31], 200).await;
+        feed_probabilities(&mut provider, &[0.9; 16], 300).await;
 
         let mut stop_task = tokio::spawn(async move {
             let outcome = provider
@@ -2009,8 +2196,8 @@ mod tests {
         provider.batch_processor_override = Some(processor.clone());
         let (result_tx, mut result_rx) = mpsc::channel(8);
         provider.start_stream(result_tx).await.unwrap();
-        provider.feed_audio(audio_chunk(16_000, 100)).await.unwrap();
-        provider.feed_audio(audio_chunk(16_000, 200)).await.unwrap();
+        feed_probabilities(&mut provider, &[0.9; 31], 100).await;
+        feed_probabilities(&mut provider, &[0.9; 31], 200).await;
 
         let error = tokio::time::timeout(Duration::from_secs(1), provider.stop_stream())
             .await
@@ -2052,10 +2239,10 @@ mod tests {
         let (them_result_tx, mut them_results) = mpsc::channel(8);
         them.start_stream(them_result_tx).await.unwrap();
 
-        you.feed_audio(audio_chunk(16_000, 100)).await.unwrap();
-        you.feed_audio(audio_chunk(16_000, 200)).await.unwrap();
-        them.feed_audio(audio_chunk(16_000, 100)).await.unwrap();
-        them.feed_audio(audio_chunk(16_000, 200)).await.unwrap();
+        feed_probabilities(&mut you, &[0.9; 31], 100).await;
+        feed_probabilities(&mut you, &[0.9; 31], 200).await;
+        feed_probabilities(&mut them, &[0.9; 31], 100).await;
+        feed_probabilities(&mut them, &[0.9; 31], 200).await;
         assert_eq!(you_started.recv().await, Some(1));
         assert_eq!(them_started.recv().await, Some(1));
 
